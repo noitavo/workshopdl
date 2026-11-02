@@ -233,7 +233,7 @@ void Window::checkUpdates(bool quiet) {
         const auto version = QVersionNumber::fromString(tag.startsWith(QLatin1Char('v')) ? tag.mid(1) : tag);
         const QUrl page(object.value(QStringLiteral("html_url")).toString());
         if (version.isNull() || page.host() != QStringLiteral("github.com") ||
-            !page.path().startsWith(QLatin1Char('/') + repo + QStringLiteral("/releases/"))) {
+            !page.path().startsWith(QLatin1Char('/') + repo + QStringLiteral("/releases/"), Qt::CaseInsensitive)) {
             if (!quiet)
                 QMessageBox::warning(this, QStringLiteral("Update check"),
                                      QStringLiteral("The repository returned an unexpected release."));
