@@ -1,5 +1,6 @@
 #include "window.h"
-#include "ui_historydialog.h"
+#include "history_model.h"
+#include "ui_mainwindow.h"
 #include "ui_dependenciesdialog.h"
 
 namespace {
@@ -36,29 +37,34 @@ void Engine::sampleTransfer() {
     const qint64 seconds = elapsed / 1000;
     const QString stage = phase == QStringLiteral("commit")  ? QStringLiteral("Saving")
                           : phase == QStringLiteral("login") ? QStringLiteral("Signing in")
-                          : phase == QStringLiteral("http")  ? QStringLiteral("Downloading")
                                                              : QStringLiteral("Downloading");
     QString text =
         QStringLiteral("%1 · %2:%3").arg(stage).arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0'));
-    if (transferBytes >= 0 && phase != QStringLiteral("commit")) {
-        text += (attemptMethod == QStringLiteral("SteamCMD") ? QStringLiteral(" · Files %1")
-                                                             : QStringLiteral(" · %1"))
-                    .arg(sizeText(transferBytes));
-        if (lastSample > 0 && elapsed > lastSample && transferBytes > lastBytes)
-            text += (attemptMethod == QStringLiteral("SteamCMD") ? QStringLiteral(" · growth %1/s")
-                                                                 : QStringLiteral(" · %1/s"))
-                        .arg(sizeText((transferBytes - lastBytes) * 1000 / (elapsed - lastSample)));
-        else
-            text += QStringLiteral(" · speed unavailable");
-        lastBytes = transferBytes;
-        lastSample = elapsed;
+    if (runTotal > 1)
+        text.prepend(QStringLiteral("Item %1 of %2 · ")
+                         .arg(qMin(succeededCount + failedCount + int(sessionDone.size()) + 1, runTotal))
+                         .arg(runTotal));
+    if (transferBytes >= 0 && phase != QStringLiteral("commit") && phase != QStringLiteral("login")) {
+        text += QStringLiteral(" · %1").arg(sizeText(transferBytes));
+        if (transferBytes != lastBytes) {
+            if (lastSample > 0 && elapsed > lastSample && transferBytes > lastBytes)
+                transferSpeed =
+                    sizeText((transferBytes - lastBytes) * 1000 / (elapsed - lastSample)) + QStringLiteral("/s");
+            lastBytes = transferBytes;
+            lastSample = elapsed;
+        } else if (elapsed - lastSample > 15000)
+            transferSpeed.clear();
+        if (!transferSpeed.isEmpty())
+            text += QStringLiteral(" · ") + transferSpeed;
     }
     if ((phase == QStringLiteral("download") || phase == QStringLiteral("http")) &&
         elapsed - lastOutput > 180000)
         text += QStringLiteral(" · No recent activity - retry or cancel");
     emit transferStatus(text);
-    if (phase != QStringLiteral("download") || sampling || process.state() != QProcess::Running)
+    if ((phase != QStringLiteral("download") && phase != QStringLiteral("login")) || sampling ||
+        process.state() != QProcess::Running || (lastFolderSample > 0 && elapsed - lastFolderSample < 5000))
         return;
+    lastFolderSample = elapsed;
     sampling = true;
     const QString path = QFileInfo(steamExe).absolutePath() + QStringLiteral("/steamapps/workshop/");
     const QString app = item->appId, id = active;
@@ -68,10 +74,25 @@ void Engine::sampleTransfer() {
         sampling = false;
         const qint64 bytes = watcher->result();
         watcher->deleteLater();
-        if (busy && generation == attemptGeneration) {
+        if (busy && generation == attemptGeneration &&
+            (phase == QStringLiteral("download") || phase == QStringLiteral("login"))) {
+            if (transferBaseline < 0)
+                transferBaseline = bytes;
             if (bytes != transferBytes)
                 lastOutput = attemptClock.elapsed();
             transferBytes = bytes;
+            if (phase == QStringLiteral("login") && bytes > transferBaseline) {
+                phase = QStringLiteral("download");
+                timeout.stop();
+            }
+            auto *current = queue->get(active);
+            if (current && transferBaseline == 0 && current->size > 0 && phase == QStringLiteral("download")) {
+                const int estimate = int(qMin(qint64(99), bytes * 100 / current->size));
+                if (estimate > current->progress) {
+                    current->progress = estimate;
+                    queue->changed(active);
+                }
+            }
         }
     });
     watcher->setFuture(QtConcurrent::run([path, app, id] {
@@ -85,14 +106,14 @@ void Engine::recordAttempt(const QString &result, const QString &error) {
     if (!item || !attemptClock.isValid())
         return;
     QStringList hidden = secrets;
-    hidden << password << settings.value(QStringLiteral("apiKey")).toString();
+    hidden << password << webApiKey;
     QJsonObject row{{QStringLiteral("time"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
                     {QStringLiteral("id"), item->id},
                     {QStringLiteral("app"), item->appId},
                     {QStringLiteral("title"), item->title},
                     {QStringLiteral("result"), result},
                     {QStringLiteral("method"), attemptMethod},
-                    {QStringLiteral("seconds"), attemptClock.elapsed() / 1000},
+                    {QStringLiteral("seconds"), attemptSeconds >= 0 ? attemptSeconds : attemptClock.elapsed() / 1000},
                     {QStringLiteral("path"), QDir(root).filePath(item->appId + QLatin1Char('/') + item->id)},
                     {QStringLiteral("error"), scrub(error, hidden)}};
     const QString path = dataRoot() + QStringLiteral("/history.jsonl");
@@ -108,6 +129,8 @@ void Engine::recordAttempt(const QString &result, const QString &error) {
     const auto bytes = QJsonDocument(row).toJson(QJsonDocument::Compact) + '\n';
     if (!file.open(QIODevice::Append) || file.write(bytes) != bytes.size())
         emit storageError(QStringLiteral("Could not save download history."));
+    file.close();
+    emit historyChanged();
 }
 
 QString Engine::diagnostics() const {
@@ -121,16 +144,24 @@ QString Engine::diagnostics() const {
             text += QString::fromUtf8(file.readAll()) + QLatin1Char('\n');
     }
     QStringList hidden = secrets;
-    hidden << password << settings.value(QStringLiteral("apiKey")).toString();
+    hidden << password << webApiKey << username;
+    text.replace(QDir::homePath(), QStringLiteral("%USERPROFILE%"), Qt::CaseInsensitive);
+    text.replace(QDir::toNativeSeparators(QDir::homePath()), QStringLiteral("%USERPROFILE%"),
+                 Qt::CaseInsensitive);
     return scrub(text, hidden);
 }
 
 QString Engine::downloadError() const {
-    const QString out = outputBuffer.toLower();
+    return failureText(outputBuffer.toLower());
+}
+
+QString Engine::failureText(const QString &out) const {
     if (out.contains(QStringLiteral("rate limit")) || out.contains(QStringLiteral("too many login")))
         return QStringLiteral("Too many sign-in attempts. Wait before retrying.");
     if (out.contains(QStringLiteral("no subscription")) || out.contains(QStringLiteral("access denied")))
-        return QStringLiteral("Access denied. Sign in with an account that owns the game.");
+        return username.isEmpty()
+                   ? QStringLiteral("Anonymous download denied. Sign in with an account that owns the game.")
+                   : QStringLiteral("Access denied. This account must own the game.");
     if (out.contains(QStringLiteral("invalid password")) || out.contains(QStringLiteral("invalid login")))
         return QStringLiteral("Sign-in failed. Check Account settings.");
     if (out.contains(QStringLiteral("file not found")))
@@ -139,77 +170,254 @@ QString Engine::downloadError() const {
         return QStringLiteral("Disk error. Check free space and folder permissions.");
     if (out.contains(QStringLiteral("connection")) || out.contains(QStringLiteral("timeout")))
         return QStringLiteral("Connection failed. Retry the item.");
-    return QStringLiteral("SteamCMD failed. Check the log or try another App ID.");
+    if (username.isEmpty())
+        return QStringLiteral("SteamCMD could not download this item anonymously. Many games require "
+                              "signing in with an account that owns the game.");
+    return QStringLiteral("SteamCMD failed. Check that this account owns the game, then see the Activity log.");
 }
 
-void Window::showHistory() {
-    QDialog dialog(this);
-    Ui::HistoryDialog form;
-    form.setupUi(&dialog);
-    auto *table = form.table;
-    auto *save = form.save;
-    auto *buttons = form.buttons;
+void Window::setupHistory() {
+    historyModel = new HistoryModel(this);
+    fullHistory = new HistoryFilter(this);
+    fullHistory->setSourceModel(historyModel);
+    fullHistory->setSortRole(Qt::UserRole);
+    panelHistory = new HistoryFilter(this);
+    panelHistory->setSourceModel(historyModel);
+    panelHistory->setLatestOnly(true);
+    auto *table = ui->historyTable;
+    table->setModel(fullHistory);
+    table->hideColumn(6);
+    table->horizontalHeader()->setHighlightSections(false);
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     table->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Stretch);
-    for (const auto &suffix : {QStringLiteral(".previous"), QString()}) {
-        QFile file(dataRoot() + QStringLiteral("/history.jsonl") + suffix);
-        if (!file.open(QIODevice::ReadOnly))
-            continue;
-        while (!file.atEnd()) {
-            const auto row = QJsonDocument::fromJson(file.readLine()).object();
-            if (row.isEmpty())
-                continue;
-            const int rowIndex = table->rowCount();
-            table->insertRow(rowIndex);
-            const QStringList values{
-                QDateTime::fromString(row.value(QStringLiteral("time")).toString(), Qt::ISODate)
-                    .toLocalTime()
-                    .toString(QStringLiteral("yyyy-MM-dd HH:mm")),
-                row.value(QStringLiteral("title")).toString() + QStringLiteral(" (") +
-                    row.value(QStringLiteral("id")).toString() + QLatin1Char(')'),
-                row.value(QStringLiteral("result")).toString(),
-                row.value(QStringLiteral("method")).toString(),
-                QString::number(row.value(QStringLiteral("seconds")).toInteger()),
-                row.value(QStringLiteral("error")).toString().isEmpty()
-                    ? row.value(QStringLiteral("path")).toString()
-                    : row.value(QStringLiteral("error")).toString()};
-            for (int n = 0; n < values.size(); ++n)
-                table->setItem(rowIndex, n, new QTableWidgetItem(values[n]));
-            table->item(rowIndex, 0)->setData(Qt::UserRole, row.value(QStringLiteral("path")).toString());
-        }
-    }
     table->setSortingEnabled(true);
     table->sortByColumn(0, Qt::DescendingOrder);
-    const auto openHistoryFolder = [this, table] {
-        const auto *item = table->item(table->currentRow(), 0);
-        if (item)
-            openFolder(item->data(Qt::UserRole).toString());
+    auto *panel = ui->browserHistory;
+    panel->setModel(panelHistory);
+    for (const int column : {0, 3, 4, 5})
+        panel->hideColumn(column);
+    panel->horizontalHeader()->setHighlightSections(false);
+    panel->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    panel->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    ui->browserHistoryEmpty->hide();
+    const auto bind = [this](QTableView *view, HistoryFilter *filter) {
+        connect(view, &QTableView::activated, this, [this, view, filter] { openHistory(view, filter); });
+        connect(view, &QTableView::customContextMenuRequested, this,
+                [this, view, filter](const QPoint &point) { historyMenu(view, filter, point); });
+        connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this, &Window::syncHistoryActions);
     };
-    connect(table, &QTableWidget::activated, &dialog, [openHistoryFolder] { openHistoryFolder(); });
-    table->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(table, &QTableWidget::customContextMenuRequested, &dialog,
-            [table, openHistoryFolder](const QPoint &point) {
-                const auto index = table->indexAt(point);
-                if (!index.isValid())
-                    return;
-                table->selectRow(index.row());
-                QMenu menu(table);
-                auto *open = menu.addAction(QStringLiteral("Open"), table, openHistoryFolder);
-                menu.setDefaultAction(open);
-                menu.exec(table->viewport()->mapToGlobal(point));
-            });
-    connect(save, &QPushButton::clicked, &dialog, [this, &dialog] {
-        const QString path = QFileDialog::getSaveFileName(&dialog, QStringLiteral("Export log"),
+    bind(table, fullHistory);
+    bind(panel, panelHistory);
+    connect(ui->historyOpen, &QPushButton::clicked, this, [this] { openHistory(ui->historyTable, fullHistory); });
+    connect(ui->browserHistoryOpen, &QPushButton::clicked, this,
+            [this] { openHistory(ui->browserHistory, panelHistory); });
+    connect(ui->historyAgain, &QPushButton::clicked, this, [this] { downloadAgain(ui->historyTable, fullHistory); });
+    connect(ui->browserHistoryAgain, &QPushButton::clicked, this,
+            [this] { downloadAgain(ui->browserHistory, panelHistory); });
+    connect(ui->historyWorkshop, &QPushButton::clicked, this, [this] {
+        const auto rows = selectedHistory(ui->historyTable, fullHistory);
+        if (!rows.isEmpty())
+            navigate(QUrl(workshopUrl(rows.first().id)));
+    });
+    connect(ui->exportLogButton, &QPushButton::clicked, this, [this] {
+        const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export log"),
                                                           QStringLiteral("WorkshopDL-log.txt"));
         if (path.isEmpty())
             return;
         QSaveFile file(path);
         const auto bytes = engine.diagnostics().toUtf8();
         if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
-            QMessageBox::warning(&dialog, QStringLiteral("Export failed"), file.errorString());
+            QMessageBox::warning(this, QStringLiteral("Export failed"), file.errorString());
     });
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    dialog.exec();
+    connect(ui->historyClear, &QPushButton::clicked, this, [this] {
+        if (QMessageBox::question(this, QStringLiteral("Clear history"),
+                                  QStringLiteral("Clear the download history? Downloaded files are kept.")) !=
+            QMessageBox::Yes)
+            return;
+        QFile::remove(dataRoot() + QStringLiteral("/history.jsonl"));
+        QFile::remove(dataRoot() + QStringLiteral("/history.jsonl.previous"));
+        historyModel->reload();
+    });
+    connect(ui->historySearch, &QLineEdit::textChanged, fullHistory, &HistoryFilter::setSearch);
+    connect(ui->historyResult, &QComboBox::currentIndexChanged, this, [this](int index) {
+        fullHistory->setResult(index == 0 ? QString() : ui->historyResult->itemText(index));
+    });
+    const auto sync = [this] {
+        const int visible = fullHistory->rowCount();
+        ui->historySummary->setText(historyModel->rowCount() == 0
+                                        ? QStringLiteral("No downloads recorded yet.")
+                                        : QStringLiteral("%1 of %2 entries").arg(visible).arg(historyModel->rowCount()));
+        const bool empty = panelHistory->rowCount() == 0;
+        ui->browserHistory->setVisible(!empty);
+        ui->browserHistoryEmpty->setVisible(empty);
+        syncHistoryActions();
+    };
+    for (auto *filter : {fullHistory, panelHistory}) {
+        connect(filter, &QAbstractItemModel::modelReset, this, sync);
+        connect(filter, &QAbstractItemModel::rowsInserted, this, sync);
+        connect(filter, &QAbstractItemModel::rowsRemoved, this, sync);
+        connect(filter, &QAbstractItemModel::layoutChanged, this, sync);
+    }
+    historyTimer.setSingleShot(true);
+    historyTimer.setInterval(300);
+    connect(&historyTimer, &QTimer::timeout, historyModel, &HistoryModel::reload);
+    connect(&engine, &Engine::historyChanged, &historyTimer, [this] { historyTimer.start(); });
+    ui->browserDownloads->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("browserPanelTab"), 0).toInt(), 1));
+    connect(ui->browserDownloads, &QTabWidget::currentChanged, this,
+            [this](int index) { engine.settings.setValue(QStringLiteral("browserPanelTab"), index); });
+    historyModel->reload();
+    sync();
+}
+
+QList<HistoryEntry> Window::selectedHistory(QTableView *view, HistoryFilter *filter) const {
+    QList<HistoryEntry> rows;
+    for (const auto &index : view->selectionModel()->selectedRows()) {
+        const auto source = filter->mapToSource(index);
+        if (source.isValid() && source.row() < historyModel->entries.size())
+            rows << historyModel->entries[source.row()];
+    }
+    return rows;
+}
+
+void Window::syncHistoryActions() {
+    if (!historyModel || !startButton)
+        return;
+    const auto update = [this](QTableView *view, HistoryFilter *filter, QPushButton *open, QPushButton *again) {
+        const auto rows = selectedHistory(view, filter);
+        open->setEnabled(std::any_of(rows.cbegin(), rows.cend(),
+                                     [](const HistoryEntry &row) { return QFileInfo(row.path).isDir(); }));
+        again->setEnabled(!diskBusy && !rows.isEmpty());
+    };
+    update(ui->historyTable, fullHistory, ui->historyOpen, ui->historyAgain);
+    update(ui->browserHistory, panelHistory, ui->browserHistoryOpen, ui->browserHistoryAgain);
+    ui->historyWorkshop->setEnabled(ui->historyTable->selectionModel()->hasSelection());
+}
+
+void Window::openHistory(QTableView *view, HistoryFilter *filter) {
+    const auto rows = selectedHistory(view, filter);
+    if (rows.isEmpty())
+        return;
+    if (QFileInfo(rows.first().path).isDir())
+        openFolder(rows.first().path);
+    else
+        navigate(QUrl(workshopUrl(rows.first().id)));
+}
+
+void Window::downloadAgain(QTableView *view, HistoryFilter *filter) {
+    QStringList ids;
+    for (const auto &row : selectedHistory(view, filter))
+        if (validId(row.id) && !ids.contains(row.id))
+            ids << row.id;
+    if (ids.isEmpty() || diskBusy)
+        return;
+    downloadNow(ids);
+    if (view == ui->browserHistory)
+        ui->browserDownloads->setCurrentIndex(0);
+    else
+        ui->downloadTabs->setCurrentIndex(0);
+}
+
+void Window::downloadNow(const QStringList &ids) {
+    downloadWhenReady.append(ids);
+    downloadWhenReady.removeDuplicates();
+    engine.resolve(ids);
+    maybeStartDownloads();
+    refresh();
+}
+
+void Window::historyMenu(QTableView *view, HistoryFilter *filter, const QPoint &point) {
+    const auto index = view->indexAt(point);
+    if (!index.isValid())
+        return;
+    if (!view->selectionModel()->isRowSelected(index.row(), {}))
+        view->selectRow(index.row());
+    const auto rows = selectedHistory(view, filter);
+    if (rows.isEmpty())
+        return;
+    QMenu menu(this);
+    auto *open = menu.addAction(QStringLiteral("Open folder"), this, [this, rows] { openFolder(rows.first().path); });
+    open->setEnabled(QFileInfo(rows.first().path).isDir());
+    menu.addAction(QStringLiteral("Open Workshop page"), this,
+                   [this, rows] { navigate(QUrl(workshopUrl(rows.first().id))); });
+    menu.addAction(QStringLiteral("Copy link"), this, [rows] {
+        QStringList links;
+        for (const auto &row : rows)
+            links << workshopUrl(row.id);
+        QApplication::clipboard()->setText(links.join(QLatin1Char('\n')));
+    });
+    menu.addSeparator();
+    auto *again = menu.addAction(QStringLiteral("Download again"), this,
+                                 [this, view, filter] { downloadAgain(view, filter); });
+    again->setEnabled(!diskBusy);
+    menu.exec(view->viewport()->mapToGlobal(point));
+}
+
+void Window::moveDownloads(const QString &from, const QString &to) {
+    struct Move {
+        QString id, source, target;
+    };
+    QList<Move> moves;
+    const QString prefix = QDir::cleanPath(from) + QLatin1Char('/');
+    for (const auto &item : library.items) {
+        const QString path = QDir::cleanPath(item.path);
+        if (path.startsWith(prefix, Qt::CaseInsensitive))
+            moves.append({item.id, path, QDir::cleanPath(to) + QLatin1Char('/') + path.mid(prefix.size())});
+    }
+    if (moves.isEmpty())
+        return;
+    diskBusy = true;
+    refresh();
+    activity->setText(QStringLiteral("Moving %1 download(s)…").arg(moves.size()));
+    using MoveResult = QPair<QHash<QString, QString>, QStringList>;
+    auto *watcher = new QFutureWatcher<MoveResult>(this);
+    connect(watcher, &QFutureWatcher<MoveResult>::finished, this, [this, watcher] {
+        const auto [moved, errors] = watcher->result();
+        watcher->deleteLater();
+        for (auto it = moved.cbegin(); it != moved.cend(); ++it)
+            if (auto *item = library.get(it.key())) {
+                item->path = it.value();
+                library.changed(it.key());
+            }
+        diskBusy = false;
+        engine.persist();
+        refresh();
+        activity->setText(QStringLiteral("%1 download(s) moved.").arg(moved.size()));
+        if (!errors.isEmpty())
+            QMessageBox::warning(this, QStringLiteral("Some downloads were not moved"),
+                                 errors.join(QLatin1Char('\n')));
+    });
+    watcher->setFuture(QtConcurrent::run([moves] {
+        QHash<QString, QString> moved;
+        QStringList errors;
+        for (const auto &move : moves) {
+            if (!QFileInfo::exists(move.source))
+                continue;
+            if (QFileInfo::exists(move.target) || linkedAncestor(move.source) ||
+                !QDir().mkpath(QFileInfo(move.target).absolutePath())) {
+                errors << QDir::toNativeSeparators(move.target) + QStringLiteral(" already exists or is not writable.");
+                continue;
+            }
+            if (!renamePath(move.source, move.target)) {
+                QString error;
+                const QString stage = move.target + QStringLiteral(".partial");
+                if (QDir(stage).exists())
+                    QDir(stage).removeRecursively();
+                if (!copyTree(move.source, stage, &error) || !renamePath(stage, move.target)) {
+                    QDir(stage).removeRecursively();
+                    errors << move.id + QStringLiteral(": ") + (error.isEmpty() ? QStringLiteral("Could not move the files.") : error);
+                    continue;
+                }
+                QDir(move.source).removeRecursively();
+            }
+            const QString receipt = move.source + QStringLiteral(".workshopdl.json");
+            if (QFileInfo::exists(receipt) && !renamePath(receipt, move.target + QStringLiteral(".workshopdl.json")))
+                QFile::copy(receipt, move.target + QStringLiteral(".workshopdl.json"));
+            QFile::remove(receipt);
+            QDir().rmdir(QFileInfo(move.source).absolutePath());
+            moved.insert(move.id, move.target);
+        }
+        return MoveResult{moved, errors};
+    }));
 }
 
 void Window::recoverLibrary() {
@@ -239,6 +447,7 @@ void Window::recoverLibrary() {
         engine.persist();
         refresh();
         activity->setText(QStringLiteral("%1 items found · %2 incomplete").arg(added).arg(incomplete));
+        engine.backfillLibrary();
     });
     watcher->setFuture(QtConcurrent::run([root] {
         QList<Item> found;
@@ -268,7 +477,7 @@ void Window::recoverLibrary() {
                 const auto receipt = readObject(target + QStringLiteral(".workshopdl.json"));
                 const bool known = receipt.value(QStringLiteral("id")).toString() == id &&
                                    receipt.value(QStringLiteral("app")).toString() == app;
-                item.local = !known || receipt.value(QStringLiteral("local")).toBool();
+                item.local = known && receipt.value(QStringLiteral("local")).toBool();
                 item.title = known ? receipt.value(QStringLiteral("title")).toString()
                                    : QStringLiteral("Recovered folder ") + id;
                 item.updated = known ? receipt.value(QStringLiteral("updated")).toString().toLongLong() : 0;
@@ -300,7 +509,8 @@ void Window::cleanCache() {
             savedCopies.insert(path, item.path);
         }
     }
-    paths << dataRoot() + QStringLiteral("/http");
+    if (QFileInfo::exists(dataRoot() + QStringLiteral("/http")))
+        paths << dataRoot() + QStringLiteral("/http");
     QStringList protectedPaths{engine.root};
     for (const auto &item : library.items)
         if (!item.path.isEmpty())
@@ -316,9 +526,13 @@ void Window::cleanCache() {
         }
         return false;
     });
+    if (paths.isEmpty()) {
+        activity->setText(QStringLiteral("The cache is already clean."));
+        return;
+    }
     if (QMessageBox::question(
             this, QStringLiteral("Clean cache"),
-            QStringLiteral("Remove %1 cache folders?\nSaved downloads are kept.").arg(paths.size())) !=
+            QStringLiteral("Remove %1 cache folder(s)?\nSaved downloads are kept.").arg(paths.size())) !=
         QMessageBox::Yes)
         return;
     diskBusy = true;
@@ -342,18 +556,24 @@ void Window::cleanCache() {
                 continue;
             }
             const qint64 bytes = treeBytes(path);
-            if (!linkedAncestor(path) && safeTree(path, nullptr, true) && QDir(path).removeRecursively())
+            if (!linkedAncestor(path) && safeTree(path, nullptr, true) && QDir(path).removeRecursively()) {
                 freed += bytes;
-            else
+                if (savedCopies.contains(path)) {
+                    QDir app(QFileInfo(path).absolutePath());
+                    const QString appId = app.dirName();
+                    if (app.cdUp() && app.cdUp())
+                        QFile::remove(app.filePath(QStringLiteral("appworkshop_%1.acf").arg(appId)));
+                }
+            } else
                 ++failed;
         }
-        return QStringLiteral("%1 freed · %2 folders kept").arg(sizeText(freed)).arg(failed);
+        return QStringLiteral("%1 freed · %2 folder(s) kept").arg(sizeText(freed)).arg(failed);
     }));
 }
 
 void Engine::reviewDependencies(const QStringList &ids, QObject *context,
                                 std::function<void(QMap<QString, QString>, QString)> callback) {
-    const QString key = settings.value(QStringLiteral("apiKey")).toString();
+    const QString key = webApiKey;
     if (key.isEmpty()) {
         callback({}, QStringLiteral("Set a Steam Web API key in Settings to check required items."));
         return;
@@ -486,7 +706,7 @@ void Window::addDependencies(const QStringList &ids, bool download) {
             auto *row = new QListWidgetItem(it.value(), list);
             row->setData(Qt::UserRole, it.key());
             row->setToolTip(workshopUrl(it.key()));
-            row->setCheckState(queue.get(it.key()) ? Qt::Unchecked : Qt::Checked);
+            row->setCheckState(queue.get(it.key()) || library.get(it.key()) ? Qt::Unchecked : Qt::Checked);
         }
         buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Add selected"));
         connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);

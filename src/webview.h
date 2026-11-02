@@ -34,14 +34,19 @@ class BrowserView final : public QWidget {
     void setFitWidth(bool enabled);
     void setZoom(double value);
     double zoom() const;
+    void returnFocus();
   signals:
     void urlChanged(const QUrl &url);
     void titleChanged(const QString &title);
     void loadingChanged(const BrowserLoadInfo &info);
     void zoomChanged(double zoom);
     void fitWidthChanged(bool enabled);
+    void acceleratorPressed(const QKeySequence &keys);
+    void runtimeUnavailable();
 
   protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
+    void paintEvent(QPaintEvent *) override;
     void showEvent(QShowEvent *) override;
     void hideEvent(QHideEvent *) override;
     void resizeEvent(QResizeEvent *) override;
@@ -52,4 +57,5 @@ class BrowserView final : public QWidget {
     std::unique_ptr<Impl> d;
     void initialize();
     void bounds();
+    void initializationFailed(const QString &message);
 };

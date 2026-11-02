@@ -25,9 +25,11 @@ void Window::openFolder(const QString &path) {
 }
 
 void Window::removeQueue(QTableView *view) {
-    if (engine.busy || diskBusy || engine.resolving)
+    if (diskBusy || engine.resolving)
         return;
-    queue.removeIds(selected(view, &queue));
+    auto ids = selected(view, &queue);
+    ids.removeIf([this](const QString &id) { return engine.inSession(id); });
+    queue.removeIds(ids);
     engine.persist();
 }
 
@@ -57,17 +59,6 @@ void Window::retryFailed() {
             ids.append(item.id);
     if (!ids.isEmpty())
         engine.resolve(ids);
-}
-
-void Window::clearCompleted() {
-    if (engine.busy || diskBusy || engine.resolving)
-        return;
-    QStringList ids;
-    for (const auto &item : queue.items)
-        if (item.status == QStringLiteral("Completed"))
-            ids.append(item.id);
-    queue.removeIds(ids);
-    engine.persist();
 }
 
 void Window::moveQueueSelection(QTableView *view, int direction) {

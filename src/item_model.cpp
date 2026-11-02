@@ -1,6 +1,9 @@
 #include "item_model.h"
 #include "storage.h"
 #include "games.h"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 ItemModel::ItemModel(QObject *parent, int maximumItems)
     : QAbstractTableModel(parent), maximumItems(maximumItems) {}
@@ -28,6 +31,8 @@ QVariant ItemModel::data(const QModelIndex &index, int role) const {
         return i.size;
     if (role == Qt::UserRole && index.column() == 4)
         return i.id.toULongLong();
+    if (role == Qt::UserRole + 1)
+        return i.status == QStringLiteral("Downloading") ? i.progress : -1;
     if (role == Qt::UserRole)
         return data(index, Qt::DisplayRole);
     if (role != Qt::DisplayRole)
@@ -38,7 +43,7 @@ QVariant ItemModel::data(const QModelIndex &index, int role) const {
     case 1:
         return i.game.isEmpty() ? gameName(i.appId) : i.game;
     case 2:
-        return sizeText(i.size);
+        return i.size > 0 ? sizeText(i.size) : QString();
     case 3:
         return i.status + (i.progress >= 0 && i.status == QStringLiteral("Downloading")
                                ? QStringLiteral(" · %1%").arg(i.progress)
@@ -49,10 +54,14 @@ QVariant ItemModel::data(const QModelIndex &index, int role) const {
     return {};
 }
 int ItemModel::find(const QString &id) const {
-    for (int n = 0; n < items.size(); ++n)
-        if (items[n].id == id)
-            return n;
-    return -1;
+    if (!rowsValid) {
+        rows.clear();
+        rows.reserve(items.size());
+        for (int n = 0; n < items.size(); ++n)
+            rows.insert(items[n].id, n);
+        rowsValid = true;
+    }
+    return rows.value(id, -1);
 }
 Item *ItemModel::get(const QString &id) {
     const int n = find(id);
@@ -64,19 +73,25 @@ bool ItemModel::add(const Item &item) {
     const int n = int(items.size());
     beginInsertRows({}, n, n);
     items.append(item);
+    rows.insert(item.id, n);
+    dirty = true;
     endInsertRows();
     return true;
 }
 void ItemModel::changed(const QString &id) {
     const int n = find(id);
+    dirty = true;
     if (n >= 0)
         emit dataChanged(index(n, 0), index(n, 4));
 }
 void ItemModel::removeIds(const QStringList &ids) {
+    const QSet<QString> doomed(ids.cbegin(), ids.cend());
     for (int n = int(items.size()) - 1; n >= 0; --n)
-        if (ids.contains(items[n].id)) {
+        if (doomed.contains(items[n].id)) {
             beginRemoveRows({}, n, n);
             items.removeAt(n);
+            rowsValid = false;
+            dirty = true;
             endRemoveRows();
         }
 }
@@ -88,11 +103,15 @@ void ItemModel::moveItem(const QString &id, int delta) {
     if (!beginMoveRows({}, from, from, {}, delta > 0 ? int(to) + 1 : int(to)))
         return;
     items.move(from, int(to));
+    rowsValid = false;
+    dirty = true;
     endMoveRows();
 }
 bool ItemModel::save(const QString &path) {
     if (unreadableFiles.contains(QFileInfo(path).absoluteFilePath()))
         return false;
+    if (!dirty && QFileInfo::exists(path))
+        return true;
     QJsonArray array;
     for (const auto &i : items)
         array.append(QJsonObject{{QStringLiteral("id"), i.id},
@@ -106,10 +125,17 @@ bool ItemModel::save(const QString &path) {
                                  {QStringLiteral("updated"), QString::number(i.updated)},
                                  {QStringLiteral("fileUrl"), i.fileUrl},
                                  {QStringLiteral("filename"), i.filename},
+                                 {QStringLiteral("preview"), i.previewUrl},
+                                 {QStringLiteral("description"), maximumItems > 0 ? QString() : i.description},
+                                 {QStringLiteral("creator"), i.creator},
+                                 {QStringLiteral("tags"), QJsonArray::fromStringList(i.tags)},
                                  {QStringLiteral("local"), i.local},
                                  {QStringLiteral("manualAppId"), i.manualAppId}});
-    return writeJson(
-        path, QJsonDocument(QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("items"), array}}));
+    const bool saved = writeJson(
+        path, QJsonDocument(QJsonObject{{QStringLiteral("version"), 2}, {QStringLiteral("items"), array}}));
+    if (saved)
+        dirty = false;
+    return saved;
 }
 QString ItemModel::load(const QString &path, bool isQueue) {
     QFile file(path);
@@ -129,8 +155,8 @@ QString ItemModel::load(const QString &path, bool isQueue) {
     const auto doc = QJsonDocument::fromJson(file.readAll(), &error);
     if (file.error() != QFileDevice::NoError)
         return failed(file.errorString());
-    if (error.error != QJsonParseError::NoError ||
-        doc.object().value(QStringLiteral("version")).toInt() != 1 ||
+    const int version = doc.object().value(QStringLiteral("version")).toInt();
+    if (error.error != QJsonParseError::NoError || (version != 1 && version != 2) ||
         !doc.object().value(QStringLiteral("items")).isArray())
         return failed(QStringLiteral("Invalid or unsupported state file."));
     QList<Item> loaded;
@@ -154,9 +180,16 @@ QString ItemModel::load(const QString &path, bool isQueue) {
         i.updated = o.value(QStringLiteral("updated")).toString().toLongLong();
         i.fileUrl = o.value(QStringLiteral("fileUrl")).toString();
         i.filename = o.value(QStringLiteral("filename")).toString();
+        i.previewUrl = o.value(QStringLiteral("preview")).toString();
+        i.description = o.value(QStringLiteral("description")).toString();
+        i.creator = o.value(QStringLiteral("creator")).toString();
+        for (const auto &tag : o.value(QStringLiteral("tags")).toArray())
+            i.tags.append(tag.toString());
         i.local = o.value(QStringLiteral("local")).toBool();
         i.manualAppId = o.value(QStringLiteral("manualAppId")).toBool() && validId(i.appId);
-        if (isQueue && i.status != QStringLiteral("Completed") && i.status != QStringLiteral("Failed"))
+        if (isQueue && i.status == QStringLiteral("Completed"))
+            continue;
+        if (isQueue && i.status != QStringLiteral("Failed"))
             i.status = i.appId.isEmpty() ? QStringLiteral("Unresolved") : QStringLiteral("Ready");
         if (!isQueue && (i.path.isEmpty() || !QDir(i.path).exists()))
             i.status = QStringLiteral("Missing files");
@@ -167,6 +200,8 @@ QString ItemModel::load(const QString &path, bool isQueue) {
     unreadableFiles.remove(QFileInfo(path).absoluteFilePath());
     beginResetModel();
     items = std::move(loaded);
+    rowsValid = false;
+    dirty = false;
     endResetModel();
     return {};
 }

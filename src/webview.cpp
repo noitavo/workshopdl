@@ -12,7 +12,26 @@ struct BrowserView::Impl {
     bool initializing = false, loading = false, fit = true;
     double scale = 1;
     bool ole = false;
+    UINT64 navigation = 0;
+    QString failure;
 };
+namespace {
+QKeySequence applicationShortcut(UINT key) {
+    if (GetKeyState(VK_CONTROL) >= 0 || GetKeyState(VK_MENU) < 0)
+        return {};
+    const bool shift = GetKeyState(VK_SHIFT) < 0;
+    if (shift)
+        return key == 'O'   ? QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O)
+               : key == 'V' ? QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V)
+                            : QKeySequence();
+    if (key >= '1' && key <= '3')
+        return QKeySequence(Qt::CTRL | Qt::Key(Qt::Key_1 + int(key - '1')));
+    return key == 'L'             ? QKeySequence(Qt::CTRL | Qt::Key_L)
+           : key == 'D'           ? QKeySequence(Qt::CTRL | Qt::Key_D)
+           : key == VK_OEM_COMMA  ? QKeySequence(Qt::CTRL | Qt::Key_Comma)
+                                  : QKeySequence();
+}
+}
 BrowserView::BrowserView(QWidget *parent) : QWidget(parent), d(std::make_unique<Impl>()) {
     d->ole = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
     setAttribute(Qt::WA_NativeWindow);
@@ -103,8 +122,37 @@ void BrowserView::bounds() {
         setZoom(steam ? qBound(0.65, double(width()) / 1050.0, 1.0) : 1.0);
     }
 }
+void BrowserView::returnFocus() {
+    SetFocus(reinterpret_cast<HWND>(window()->winId()));
+}
+void BrowserView::initializationFailed(const QString &message) {
+    d->initializing = false;
+    d->failure = message;
+    update();
+    emit loadingChanged({BrowserLoadInfo::LoadStatus::Failed, url(), message});
+    LPWSTR version = nullptr;
+    const HRESULT available = GetAvailableCoreWebView2BrowserVersionString(nullptr, &version);
+    const bool installed = SUCCEEDED(available) && version;
+    CoTaskMemFree(version);
+    if (!installed)
+        emit runtimeUnavailable();
+}
+bool BrowserView::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == window() && event->type() == QEvent::Move && d->controller)
+        d->controller->NotifyParentWindowPositionChanged();
+    return QWidget::eventFilter(watched, event);
+}
+void BrowserView::paintEvent(QPaintEvent *) {
+    if (d->failure.isEmpty())
+        return;
+    QPainter painter(this);
+    painter.fillRect(rect(), palette().color(QPalette::Base));
+    painter.setPen(palette().color(QPalette::Text));
+    painter.drawText(rect().adjusted(24, 24, -24, -24), Qt::AlignCenter | Qt::TextWordWrap, d->failure);
+}
 void BrowserView::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
+    window()->installEventFilter(this);
     if (!d->initializing)
         initialize();
     if (d->controller)
@@ -132,6 +180,7 @@ void BrowserView::focusInEvent(QFocusEvent *event) {
 }
 void BrowserView::initialize() {
     d->initializing = true;
+    d->failure.clear();
     QPointer<BrowserView> self(this);
     const auto profile = QDir::toNativeSeparators(dataRoot() + QStringLiteral("/WebView2")).toStdWString();
     const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
@@ -142,9 +191,7 @@ void BrowserView::initialize() {
             if (!self)
                 return S_OK;
             if (FAILED(result) || !env) {
-                self->d->initializing = false;
-                emit self->loadingChanged({BrowserLoadInfo::LoadStatus::Failed, self->url(),
-                                           QStringLiteral("WebView2 Runtime could not start.")});
+                self->initializationFailed(QStringLiteral("The WebView2 Runtime could not start."));
                 return S_OK;
             }
             const HRESULT created = env->CreateCoreWebView2Controller(
@@ -157,9 +204,7 @@ void BrowserView::initialize() {
                             return S_OK;
                         }
                         if (FAILED(error) || !controller) {
-                            self->d->initializing = false;
-                            emit self->loadingChanged({BrowserLoadInfo::LoadStatus::Failed, self->url(),
-                                                       QStringLiteral("Cannot create WebView2 controller.")});
+                            self->initializationFailed(QStringLiteral("The embedded browser could not start."));
                             return S_OK;
                         }
                         auto &d = *self->d;
@@ -168,13 +213,63 @@ void BrowserView::initialize() {
                         if (!d.core) {
                             controller->Close();
                             d.controller.Reset();
-                            d.initializing = false;
-                            emit self->loadingChanged(
-                                {BrowserLoadInfo::LoadStatus::Failed, self->url(),
-                                 QStringLiteral("WebView2 is unavailable. Reload to retry.")});
+                            self->initializationFailed(QStringLiteral("The embedded browser could not start."));
                             return S_OK;
                         }
+                        ComPtr<ICoreWebView2Settings> webSettings;
+                        if (SUCCEEDED(d.core->get_Settings(&webSettings)) && webSettings)
+                            webSettings->put_AreDevToolsEnabled(FALSE);
                         EventRegistrationToken token;
+                        controller->add_AcceleratorKeyPressed(
+                            Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+                                [self](ICoreWebView2Controller *,
+                                       ICoreWebView2AcceleratorKeyPressedEventArgs *args) -> HRESULT {
+                                    if (!self)
+                                        return S_OK;
+                                    COREWEBVIEW2_KEY_EVENT_KIND kind;
+                                    UINT key = 0;
+                                    args->get_KeyEventKind(&kind);
+                                    args->get_VirtualKey(&key);
+                                    if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN)
+                                        return S_OK;
+                                    const QKeySequence keys = applicationShortcut(key);
+                                    if (keys.isEmpty())
+                                        return S_OK;
+                                    args->put_Handled(TRUE);
+                                    emit self->acceleratorPressed(keys);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+                        d.core->add_ProcessFailed(
+                            Callback<ICoreWebView2ProcessFailedEventHandler>(
+                                [self](ICoreWebView2 *,
+                                       ICoreWebView2ProcessFailedEventArgs *args) -> HRESULT {
+                                    if (!self)
+                                        return S_OK;
+                                    COREWEBVIEW2_PROCESS_FAILED_KIND kind;
+                                    args->get_ProcessFailedKind(&kind);
+                                    if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE)
+                                        return S_OK;
+                                    const bool restart =
+                                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
+                                    QTimer::singleShot(0, self.data(), [self, restart] {
+                                        if (!self)
+                                            return;
+                                        if (restart) {
+                                            if (self->d->controller)
+                                                self->d->controller->Close();
+                                            self->d->core.Reset();
+                                            self->d->controller.Reset();
+                                            self->d->initializing = false;
+                                            self->d->loading = false;
+                                        }
+                                        self->reload();
+                                    });
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
                         controller->add_MoveFocusRequested(
                             Callback<ICoreWebView2MoveFocusRequestedEventHandler>(
                                 [self](ICoreWebView2Controller *,
@@ -205,6 +300,7 @@ void BrowserView::initialize() {
                                         args->put_Cancel(TRUE);
                                         return S_OK;
                                     }
+                                    args->get_NavigationId(&self->d->navigation);
                                     self->d->address = url;
                                     self->d->loading = true;
                                     self->bounds();
@@ -221,8 +317,17 @@ void BrowserView::initialize() {
                                        ICoreWebView2NavigationCompletedEventArgs *args) -> HRESULT {
                                     if (!self)
                                         return S_OK;
+                                    UINT64 navigation = 0;
+                                    args->get_NavigationId(&navigation);
+                                    if (navigation != self->d->navigation)
+                                        return S_OK;
                                     BOOL success;
                                     args->get_IsSuccess(&success);
+                                    COREWEBVIEW2_WEB_ERROR_STATUS status =
+                                        COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                                    args->get_WebErrorStatus(&status);
+                                    if (status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED)
+                                        success = TRUE;
                                     self->d->loading = false;
                                     emit self->loadingChanged(
                                         {success ? BrowserLoadInfo::LoadStatus::Succeeded
@@ -315,16 +420,12 @@ void BrowserView::initialize() {
                         return S_OK;
                     })
                     .Get());
-            if (FAILED(created)) {
-                self->d->initializing = false;
-                emit self->loadingChanged({BrowserLoadInfo::LoadStatus::Failed, self->url(),
-                                           QStringLiteral("Cannot create WebView2. Reload to retry.")});
-            }
+            if (FAILED(created))
+                self->initializationFailed(QStringLiteral("The embedded browser could not start."));
             return S_OK;
         }).Get());
-    if (FAILED(hr)) {
-        d->initializing = false;
-        emit loadingChanged(
-            {BrowserLoadInfo::LoadStatus::Failed, url(), QStringLiteral("WebView2 initialization failed.")});
-    }
+    if (FAILED(hr))
+        initializationFailed(QStringLiteral(
+            "The Browse tab requires the Microsoft Edge WebView2 Runtime. Downloads from the Downloads tab "
+            "still work."));
 }

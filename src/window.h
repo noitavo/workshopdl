@@ -10,7 +10,10 @@ namespace Ui {
 class MainWindow;
 }
 
-class LibraryFilter;
+class HistoryFilter;
+class HistoryModel;
+class ModsPage;
+struct HistoryEntry;
 class SteamSetupDialog;
 
 class Window : public QMainWindow {
@@ -18,6 +21,10 @@ class Window : public QMainWindow {
   public:
     Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadEngine);
     ~Window() override;
+    void queueLinks(const QString &text);
+
+  signals:
+    void logLine(const QString &text);
 
   protected:
     void closeEvent(QCloseEvent *) override;
@@ -29,10 +36,12 @@ class Window : public QMainWindow {
     ItemModel &queue, &library;
     Engine &engine;
     QTabWidget *tabs = nullptr;
-    QTableView *queueView = nullptr, *libraryView = nullptr, *browserQueue = nullptr;
+    QTableView *queueView = nullptr, *browserQueue = nullptr;
     QWidget *browserItemPanel = nullptr;
-    LibraryFilter *libraryFilter = nullptr;
-    QLineEdit *input = nullptr, *search = nullptr, *address = nullptr;
+    ModsPage *modsPage = nullptr;
+    HistoryModel *historyModel = nullptr;
+    HistoryFilter *fullHistory = nullptr, *panelHistory = nullptr;
+    QLineEdit *input = nullptr, *address = nullptr;
     QLabel *summary = nullptr, *activity = nullptr, *details = nullptr;
     QPointer<SteamSetupDialog> steamSetupDialog;
     QLabel *pageTitle = nullptr, *pageStatus = nullptr, *browserCount = nullptr;
@@ -65,20 +74,22 @@ class Window : public QMainWindow {
     QStringList automaticInstalls;
     bool autoStartScheduled = false;
     bool dependenciesReviewed = false;
+    bool closeRequested = false, collectionOpen = false, runtimeNotified = false;
+    struct PendingCollection {
+        QString id, title;
+        QStringList children;
+    };
+    QList<PendingCollection> pendingCollections;
+    QTimer refreshTimer, historyTimer;
+    QPointer<QDialog> logDialog;
+    QString browserError;
+    void showGettingStarted();
     QHash<QString, QSet<QString>> collectionHistory;
     bool diskBusy = false;
     QHash<QString, QString> discoveredGameFolders;
-    QTableWidget *installedView = nullptr;
-    QLabel *installedNote = nullptr;
-    QComboBox *libraryGameFilter = nullptr;
-    QListWidget *modGames = nullptr;
-    QLabel *modFolder = nullptr;
-    QPushButton *modActivation = nullptr, *modLauncher = nullptr;
-    QString selectedModGame() const;
-    void gameActivation();
+    QSet<QString> accountPrompted;
     void setupDownloads();
     void setupBrowser();
-    void setupLibrary();
     void setupDownloadMethods();
     void configureTable(QTableView *view, ItemModel *model);
     QStringList selected(QTableView *view, ItemModel *model) const;
@@ -89,10 +100,6 @@ class Window : public QMainWindow {
     void guardDialog(const QString &prompt);
     void collectionDialog(const QString &id, const QString &title, const QStringList &children);
     void queueMenu(const QPoint &pos, QTableView *view);
-    void libraryMenu(const QPoint &pos);
-    void installSelected();
-    void openSelected(bool website);
-    void deleteSelected();
     void appendLog(const QString &text);
     void navigate(const QUrl &url);
     void syncBrowser();
@@ -106,24 +113,25 @@ class Window : public QMainWindow {
     void openFolder(const QString &path);
     void startQueue(QTableView *selection = nullptr);
     void retryFailed();
-    void clearCompleted();
     void moveQueueSelection(QTableView *view, int direction);
     void showLog();
     void showSupport();
     void gameTools();
-    void setupInstalled();
-    void reloadInstalled();
-    void installedAction(const QString &action);
-    void installItems(const QStringList &ids, bool automatic = false);
     void checkUpdates(bool quiet = false);
     void pasteMultiple();
     void browseGame();
     void fillBookmarks(QMenu *menu);
     void editBookmark(const QString &id = {});
-    void activationDialog();
     void importLocalMod(bool folder);
     void recoverLibrary();
     void cleanCache();
-    void showHistory();
+    void setupHistory();
+    QList<HistoryEntry> selectedHistory(QTableView *view, HistoryFilter *filter) const;
+    void syncHistoryActions();
+    void historyMenu(QTableView *view, HistoryFilter *filter, const QPoint &point);
+    void openHistory(QTableView *view, HistoryFilter *filter);
+    void downloadAgain(QTableView *view, HistoryFilter *filter);
+    void downloadNow(const QStringList &ids);
+    void moveDownloads(const QString &from, const QString &to);
     void addDependencies(const QStringList &ids, bool download = false);
 };

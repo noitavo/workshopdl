@@ -2,8 +2,37 @@
 #include "ui_mainwindow.h"
 #include "ui_statuspanel.h"
 #include "ui_logdialog.h"
-#include "library_filter.h"
+#include "modspage.h"
 #include "steamsetupdialog.h"
+#include "taskbar.h"
+
+namespace {
+class StatusDelegate : public QStyledItemDelegate {
+  public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        const int percent = index.data(Qt::UserRole + 1).toInt();
+        if (percent < 0) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
+        QStyleOptionViewItem item = option;
+        initStyleOption(&item, index);
+        const QStyle *style = item.widget ? item.widget->style() : QApplication::style();
+        style->drawPrimitive(QStyle::PE_PanelItemViewItem, &item, painter, item.widget);
+        QStyleOptionProgressBar bar;
+        bar.rect = option.rect.adjusted(2, 3, -2, -3);
+        bar.minimum = 0;
+        bar.maximum = 100;
+        bar.progress = percent;
+        bar.text = QStringLiteral("%1%").arg(percent);
+        bar.textVisible = true;
+        bar.state = QStyle::State_Enabled | QStyle::State_Horizontal;
+        bar.palette = option.palette;
+        style->drawControl(QStyle::CE_ProgressBar, &bar, painter, item.widget);
+    }
+};
+}
 
 Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadEngine)
     : ui(std::make_unique<Ui::MainWindow>()), queue(queueModel), library(libraryModel),
@@ -11,11 +40,9 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
     ui->setupUi(this);
     tabs = ui->tabs;
     queueView = ui->queueView;
-    libraryView = ui->libraryView;
     browserQueue = ui->browserQueue;
     browserItemPanel = ui->browserItemPanel;
     input = ui->input;
-    search = ui->search;
     address = ui->address;
     summary = ui->summary;
     details = ui->details;
@@ -41,13 +68,6 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
     reloadButton = ui->reloadButton;
     web = ui->web;
     browserSplitter = ui->browserSplitter;
-    installedView = ui->installedView;
-    installedNote = ui->installedNote;
-    libraryGameFilter = ui->libraryGameFilter;
-    modGames = ui->modGames;
-    modFolder = ui->modFolder;
-    modActivation = ui->modActivation;
-    modLauncher = ui->modLauncher;
     setWindowIcon(QIcon(QStringLiteral(":/branding/workshopdl.png")));
     auto *statusPanel = new QWidget(this);
     Ui::StatusPanel statusUi;
@@ -72,10 +92,30 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
     log->setReadOnly(true);
     log->setMaximumBlockCount(2000);
     log->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    refreshTimer.setSingleShot(true);
+    refreshTimer.setInterval(50);
+    connect(&refreshTimer, &QTimer::timeout, this, &Window::refresh);
     setupDownloads();
     setupBrowser();
-    setupLibrary();
-    setupInstalled();
+    modsPage = new ModsPage(engine, queue, library, this);
+    tabs->addTab(modsPage, QStringLiteral("Mods"));
+    tabs->setTabToolTip(2, QStringLiteral("Your downloaded mods, by game"));
+    connect(modsPage, &ModsPage::busyChanged, this, [this](bool busy) {
+        diskBusy = busy;
+        refresh();
+    });
+    connect(modsPage, &ModsPage::navigateRequested, this, &Window::navigate);
+    connect(modsPage, &ModsPage::status, this, [this](const QString &text) { activity->setText(text); });
+    connect(modsPage, &ModsPage::log, this, &Window::appendLog);
+    connect(modsPage, &ModsPage::downloadRequested, this, &Window::downloadNow);
+    connect(modsPage, &ModsPage::queueRequested, this, [this](const QStringList &ids) {
+        engine.resolve(ids);
+        tabs->setCurrentIndex(1);
+    });
+    connect(modsPage, &ModsPage::requiredRequested, this, [this](const QStringList &ids) { addDependencies(ids); });
+    connect(modsPage, &ModsPage::importRequested, this, &Window::importLocalMod);
+    connect(modsPage, &ModsPage::recoverRequested, this, &Window::recoverLibrary);
+    setupHistory();
     createMenus();
     connect(&engine, &Engine::activity, this, [this](const QString &text) {
         activity->setText(text);
@@ -98,17 +138,20 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
     });
     connect(&engine, &Engine::busyChanged, this, [this](bool busy) {
         refresh();
+        if (!busy && !isActiveWindow())
+            QApplication::alert(this);
+        if (!busy && closeRequested)
+            return;
         if (!busy && engine.settings.value(QStringLiteral("openAfter"), false).toBool() &&
             !lastCompletedPath.isEmpty()) {
             QDesktopServices::openUrl(QUrl::fromLocalFile(lastCompletedPath));
-            lastCompletedPath.clear();
         }
+        if (!busy)
+            lastCompletedPath.clear();
         if (!busy) {
-            if (engine.settings.value(QStringLiteral("autoInstall")).toBool()) {
-                const auto ids = automaticInstalls;
-                installItems(ids, true);
-            }
+            const auto ids = automaticInstalls;
             automaticInstalls.clear();
+            modsPage->afterDownloads(ids, engine.settings.value(QStringLiteral("autoInstall")).toBool());
         }
         maybeStartDownloads();
     });
@@ -117,8 +160,35 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
             lastCompletedPath = item->path;
         automaticInstalls << id;
     });
-    connect(&engine, &Engine::authRequired, this, &Window::guardDialog);
-    connect(&engine, &Engine::collectionReady, this, &Window::collectionDialog);
+    connect(&engine, &Engine::authRequired, this, &Window::guardDialog, Qt::QueuedConnection);
+    connect(&engine, &Engine::collectionReady, this, &Window::collectionDialog, Qt::QueuedConnection);
+    connect(web, &BrowserView::acceleratorPressed, this, [this](const QKeySequence &keys) {
+        QTimer::singleShot(0, this, [this, keys] {
+            web->returnFocus();
+            for (auto *action : findChildren<QAction *>())
+                if (action->isEnabled() && action->shortcuts().contains(keys)) {
+                    action->trigger();
+                    return;
+                }
+            for (auto *shortcut : findChildren<QShortcut *>())
+                if (shortcut->isEnabled() && shortcut->key() == keys) {
+                    emit shortcut->activated();
+                    return;
+                }
+        });
+    });
+    connect(web, &BrowserView::runtimeUnavailable, this, [this] {
+        if (runtimeNotified)
+            return;
+        runtimeNotified = true;
+        QTimer::singleShot(0, this, [this] {
+            if (QMessageBox::question(this, QStringLiteral("WebView2 Runtime required"),
+                                      QStringLiteral("The Browse tab requires the Microsoft Edge WebView2 "
+                                                     "Runtime. Open the download page?")) == QMessageBox::Yes)
+                QDesktopServices::openUrl(
+                    QUrl(QStringLiteral("https://developer.microsoft.com/microsoft-edge/webview2/")));
+        });
+    });
     connect(&engine, &Engine::storageError, this, [this](const QString &text) {
         appendLog(text);
         activity->setText(text);
@@ -128,12 +198,9 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
         activity->setText(QStringLiteral("Some saved data could not be loaded. See Activity log."));
     }
     for (auto *model : {&queue, &library}) {
-        connect(model, &QAbstractItemModel::rowsInserted, this, [this] { refresh(); });
-        connect(model, &QAbstractItemModel::rowsRemoved, this, [this] { refresh(); });
-        connect(model, &QAbstractItemModel::dataChanged, this, [this] {
-            refresh();
-            maybeStartDownloads();
-        });
+        connect(model, &QAbstractItemModel::rowsInserted, this, [this] { refreshTimer.start(); });
+        connect(model, &QAbstractItemModel::rowsRemoved, this, [this] { refreshTimer.start(); });
+        connect(model, &QAbstractItemModel::dataChanged, this, [this] { refreshTimer.start(); });
     }
     auto shortcut = [this](const QKeySequence &key, std::function<void()> action) {
         auto *s = new QShortcut(key, this);
@@ -172,17 +239,16 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
             saveTabLayout();
             restoreTabLayout(index);
         }
-        if (index == 3)
-            reloadInstalled();
         engine.settings.setValue(QStringLiteral("lastTab"), index);
     });
     if (engine.settings.value(QStringLiteral("rememberTab"), true).toBool())
-        tabs->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("lastTab"), 0).toInt(), 3));
+        tabs->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("lastTab"), 0).toInt(), 2));
     else
-        tabs->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("startupTab"), 0).toInt(), 3));
+        tabs->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("startupTab"), 0).toInt(), 2));
     restoreTabLayout(tabs->currentIndex());
     connect(QApplication::clipboard(), &QClipboard::dataChanged, this, [this] {
-        if (!engine.settings.value(QStringLiteral("clipboardQueue")).toBool())
+        if (!engine.settings.value(QStringLiteral("clipboardQueue")).toBool() ||
+            QApplication::clipboard()->ownsClipboard())
             return;
         const QString text = QApplication::clipboard()->text();
         if (text.contains(QStringLiteral("steamcommunity.com/"), Qt::CaseInsensitive))
@@ -198,7 +264,7 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
         diskBusy = false;
         if (!error.isEmpty())
             appendLog(error);
-        reloadInstalled();
+        modsPage->setDiscoveredGames(folders);
         refresh();
         if (engine.settings.value(QStringLiteral("checkModsAtStartup"), false).toBool())
             engine.checkLibrary();
@@ -206,11 +272,20 @@ Window::Window(ItemModel &queueModel, ItemModel &libraryModel, Engine &downloadE
     recovery->setFuture(
         QtConcurrent::run([] { return StartupResult{recoverInstallations(), discoverGames()}; }));
     refresh();
-    if (engine.settings.value(QStringLiteral("automaticUpdates")).toBool() &&
-        QDateTime::currentSecsSinceEpoch() -
-                engine.settings.value(QStringLiteral("lastUpdateCheck"), 0).toLongLong() >
-            7 * 24 * 3600)
+    if (engine.settings.value(QStringLiteral("checkUpdatesAtStartup"), true).toBool())
         QTimer::singleShot(2000, this, [this] { checkUpdates(true); });
+    auto *modCheck = new QTimer(this);
+    modCheck->setInterval(6 * 3600 * 1000);
+    connect(modCheck, &QTimer::timeout, this, [this] {
+        if (engine.settings.value(QStringLiteral("checkModsAtStartup"), false).toBool() && !engine.busy && !diskBusy &&
+            !engine.checkingUpdates)
+            engine.checkLibrary();
+    });
+    modCheck->start();
+    if (!engine.settings.value(QStringLiteral("guideShown"), false).toBool()) {
+        engine.settings.setValue(QStringLiteral("guideShown"), true);
+        QTimer::singleShot(500, this, &Window::showGettingStarted);
+    }
 }
 
 Window::~Window() = default;
@@ -225,6 +300,7 @@ void Window::configureTable(QTableView *view, ItemModel *model) {
     view->setColumnWidth(2, 75);
     view->setColumnWidth(3, 120);
     view->setColumnWidth(4, 105);
+    view->setItemDelegateForColumn(3, new StatusDelegate(view));
 }
 
 void Window::setupDownloadMethods() {
@@ -270,13 +346,15 @@ void Window::setupDownloads() {
             addText(input->text());
             return;
         }
-        downloadWhenReady = ids;
+        downloadWhenReady.append(ids);
+        downloadWhenReady.removeDuplicates();
         addText(input->text());
         maybeStartDownloads();
     });
     connect(ui->addToQueueButton, &QPushButton::clicked, this, [this] { addText(input->text()); });
     connect(input, &QLineEdit::returnPressed, this, [this] { addText(input->text()); });
     connect(ui->collectionButton, &QPushButton::clicked, this, &Window::collectionImport);
+    connect(ui->accountButton, &QPushButton::clicked, this, &Window::accountDialog);
     connect(queueView, &QTableView::customContextMenuRequested, this,
             [this](const QPoint &pos) { queueMenu(pos, queueView); });
     connect(queueView, &QTableView::activated, this,
@@ -293,17 +371,15 @@ void Window::setupDownloads() {
     auto *remove = queueMenu->addAction(QStringLiteral("Remove selected\tDelete"), this,
                                         [this] { removeQueue(queueView); });
     queueMenu->addSeparator();
-    auto *clear = queueMenu->addAction(QStringLiteral("Clear completed"), this, &Window::clearCompleted);
     auto *retry = queueMenu->addAction(QStringLiteral("Retry failed"), this, &Window::retryFailed);
-    connect(queueMenu, &QMenu::aboutToShow, this, [this, remove, clear, retry] {
+    connect(queueMenu, &QMenu::aboutToShow, this, [this, remove, retry] {
         const bool idle = !engine.busy && !diskBusy && engine.resolving == 0;
-        bool completed = false, failed = false;
+        const bool removable = !diskBusy && engine.resolving == 0;
+        bool failed = false;
         for (const auto &item : queue.items) {
-            completed |= item.status == QStringLiteral("Completed");
             failed |= item.status == QStringLiteral("Failed") || item.status == QStringLiteral("Unresolved");
         }
-        remove->setEnabled(idle && !selected(queueView, &queue).isEmpty());
-        clear->setEnabled(idle && completed);
+        remove->setEnabled(removable && !selected(queueView, &queue).isEmpty());
         retry->setEnabled(idle && failed);
     });
     auto *deleteKey = new QShortcut(QKeySequence::Delete, queueView);
@@ -322,101 +398,20 @@ void Window::setupDownloads() {
     connect(startButton, &QPushButton::clicked, this, [this] { startQueue(); });
 }
 
-void Window::setupLibrary() {
-    libraryGameFilter->setItemData(0, QString());
-    auto *updatesOnly = ui->updatesOnly;
-    connect(ui->checkUpdatesButton, &QPushButton::clicked, this, [this] {
-        if (!engine.busy && !diskBusy)
-            engine.checkLibrary();
-    });
-    connect(ui->updateSelectedButton, &QPushButton::clicked, this, [this] {
-        if (engine.busy || diskBusy)
-            return;
-        auto ids = selected(libraryView, &library);
-        ids.removeIf([this](const QString &id) { return library.get(id)->local; });
-        if (ids.isEmpty()) {
-            activity->setText(QStringLiteral("Select Workshop items to update."));
-            return;
-        }
-        downloadWhenReady = ids;
-        engine.resolve(ids);
-    });
-    connect(ui->openLibraryFolderButton, &QPushButton::clicked, this, [this] { openSelected(false); });
-    connect(ui->workshopPageButton, &QPushButton::clicked, this, [this] { openSelected(true); });
-    connect(ui->installButton, &QPushButton::clicked, this, &Window::installSelected);
-    configureTable(libraryView, &library);
-    libraryFilter = new LibraryFilter(this);
-    libraryFilter->setSortRole(Qt::UserRole);
-    libraryFilter->setSortCaseSensitivity(Qt::CaseInsensitive);
-    libraryFilter->setSourceModel(&library);
-    libraryView->setModel(libraryFilter);
-    libraryView->setSortingEnabled(true);
-    libraryView->sortByColumn(0, Qt::AscendingOrder);
-    connect(updatesOnly, &QCheckBox::toggled, this, [this](bool on) { libraryFilter->setUpdatesOnly(on); });
-    connect(search, &QLineEdit::textChanged, this,
-            [this](const QString &text) { libraryFilter->setSearch(text); });
-    connect(libraryGameFilter, &QComboBox::currentIndexChanged, this,
-            [this] { libraryFilter->setGame(libraryGameFilter->currentData().toString()); });
-    const auto syncGames = [this] {
-        QMap<QString, QString> names;
-        for (const auto &item : library.items) {
-            if (!item.appId.isEmpty())
-                names.insert(item.appId, item.game.isEmpty() ? gameName(item.appId) : item.game);
-        }
-        QList<QPair<QString, QString>> games;
-        for (auto it = names.cbegin(); it != names.cend(); ++it)
-            games.append({it.key(), it.value()});
-        std::sort(games.begin(), games.end(), [](const auto &a, const auto &b) {
-            const int order = QString::localeAwareCompare(a.second, b.second);
-            return order == 0 ? a.first < b.first : order < 0;
-        });
-        bool same = libraryGameFilter->count() == games.size() + 1;
-        for (int n = 0; same && n < games.size(); ++n)
-            same = libraryGameFilter->itemData(n + 1).toString() == games[n].first &&
-                   libraryGameFilter->itemText(n + 1) == games[n].second;
-        if (same)
-            return;
-
-        const QString previous = libraryGameFilter->currentData().toString();
-        {
-            QSignalBlocker block(libraryGameFilter);
-            libraryGameFilter->hidePopup();
-            libraryGameFilter->clear();
-            libraryGameFilter->addItem(QStringLiteral("All games"), QString());
-            for (const auto &game : games)
-                libraryGameFilter->addItem(game.second, game.first);
-            libraryGameFilter->setCurrentIndex(qMax(0, libraryGameFilter->findData(previous)));
-        }
-        libraryFilter->setGame(libraryGameFilter->currentData().toString());
-    };
-    connect(&library, &QAbstractItemModel::rowsInserted, this, syncGames);
-    connect(&library, &QAbstractItemModel::rowsRemoved, this, syncGames);
-    connect(&library, &QAbstractItemModel::dataChanged, this, syncGames);
-    connect(&library, &QAbstractItemModel::modelReset, this, syncGames);
-    syncGames();
-    connect(libraryView, &QTableView::customContextMenuRequested, this, &Window::libraryMenu);
-    connect(libraryView, &QTableView::doubleClicked, this, [this] { openSelected(false); });
-    connect(ui->importFolderButton, &QPushButton::clicked, this, [this] { importLocalMod(true); });
-    connect(ui->importPackageButton, &QPushButton::clicked, this, [this] { importLocalMod(false); });
-    connect(ui->removeRecordButton, &QPushButton::clicked, this, [this] {
-        if (!engine.busy && !diskBusy) {
-            library.removeIds(selected(libraryView, &library));
-            engine.persist();
-        }
-    });
-    connect(ui->deleteFilesButton, &QPushButton::clicked, this, &Window::deleteSelected);
-    connect(libraryView->selectionModel(), &QItemSelectionModel::selectionChanged, this,
-            [this] { refresh(); });
-}
-
 QStringList Window::selected(QTableView *view, ItemModel *model) const {
     QStringList ids;
     for (const auto &index : view->selectionModel()->selectedRows()) {
-        const auto source = view == libraryView ? libraryFilter->mapToSource(index) : index;
-        if (source.row() >= 0 && source.row() < model->items.size())
-            ids.append(model->items[source.row()].id);
+        if (index.row() >= 0 && index.row() < model->items.size())
+            ids.append(model->items[index.row()].id);
     }
     return ids;
+}
+void Window::queueLinks(const QString &text) {
+    addText(text);
+    if (isMinimized())
+        showNormal();
+    raise();
+    activateWindow();
 }
 void Window::addText(const QString &text) {
     const auto ids = parseIds(text);
@@ -449,26 +444,24 @@ void Window::addText(const QString &text) {
     refresh();
 }
 void Window::refresh() {
-    if (!startButton || !browserCount || !activity)
+    if (!startButton || !browserCount || !activity || !modsPage)
         return;
-    int ready = 0, done = 0, failed = 0;
+    int ready = 0, failed = 0;
     const Item *current = nullptr;
     for (const auto &i : queue.items) {
         if (i.status == QStringLiteral("Ready") || i.status == QStringLiteral("Cancelled"))
             ++ready;
-        if (i.status == QStringLiteral("Completed"))
-            ++done;
         if (i.status == QStringLiteral("Failed"))
             ++failed;
         if (i.status == QStringLiteral("Downloading") || i.status == QStringLiteral("Verifying"))
             current = &i;
     }
-    summary->setText(QStringLiteral("%1 items · %2 ready · %3 completed%4")
+    summary->setText(QStringLiteral("%1 in queue · %2 ready%3")
                          .arg(queue.items.size())
                          .arg(ready)
-                         .arg(done)
                          .arg(failed ? QStringLiteral(" · %1 failed").arg(failed) : QString()));
-    browserCount->setText(QStringLiteral("%1 ready · %2 completed").arg(ready).arg(done));
+    browserCount->setText(failed ? QStringLiteral("%1 ready · %2 failed").arg(ready).arg(failed)
+                                 : QStringLiteral("%1 ready").arg(ready));
     const bool canModifyQueue = !engine.busy && !diskBusy && engine.resolving == 0;
     startButton->setEnabled(canModifyQueue && ready > 0);
     browserStart->setEnabled(canModifyQueue && (ready > 0 || queue.items.isEmpty()));
@@ -494,7 +487,7 @@ void Window::refresh() {
     browserSelected->setToolTip(selectedReady
                                     ? QStringLiteral("Download the ready items in your selection")
                                     : QStringLiteral("Select ready items, or choose Retry failed."));
-    browserRemove->setEnabled(!engine.busy && !diskBusy && !browserIds.isEmpty());
+    browserRemove->setEnabled(!diskBusy && engine.resolving == 0 && !browserIds.isEmpty());
     bool retryable = false;
     for (const auto &item : queue.items)
         retryable |= item.status == QStringLiteral("Failed") || item.status == QStringLiteral("Unresolved");
@@ -505,40 +498,31 @@ void Window::refresh() {
     browserCancel->setVisible(engine.busy || pendingStart);
     ui->moveUpButton->setEnabled(canModifyQueue && !browserIds.isEmpty());
     ui->moveDownButton->setEnabled(canModifyQueue && !browserIds.isEmpty());
-    ui->clearCompletedButton->setEnabled(canModifyQueue && done > 0);
     queueToolsToggle->setVisible(!queue.items.isEmpty());
     browserAdvanced->setVisible(!queue.items.isEmpty() && queueToolsToggle->isChecked());
     accountAction->setEnabled(!engine.busy && !diskBusy);
     const bool idle = !engine.busy && !diskBusy;
-    const auto libraryIds = selected(libraryView, &library);
-    const bool hasLibrarySelection = !libraryIds.isEmpty();
-    bool hasRemoteItems = false, hasInstallableItems = false;
-    for (const auto &id : libraryIds) {
-        const auto *item = library.get(id);
-        hasRemoteItems |= !item->local;
-        hasInstallableItems |= profileFor(item->appId).format != QStringLiteral("manual");
-    }
-    ui->checkUpdatesButton->setEnabled(idle && !engine.checkingUpdates && !library.items.isEmpty());
-    ui->updateSelectedButton->setEnabled(idle && hasRemoteItems);
-    ui->openLibraryFolderButton->setEnabled(hasLibrarySelection);
-    ui->workshopPageButton->setEnabled(hasLibrarySelection && !library.get(libraryIds.first())->local);
-    ui->installButton->setEnabled(idle && hasInstallableItems);
-    ui->removeRecordButton->setEnabled(idle && hasLibrarySelection);
-    ui->deleteFilesButton->setEnabled(idle && hasLibrarySelection);
-    ui->importFolderButton->setEnabled(idle);
-    ui->importPackageButton->setEnabled(idle);
-    const bool hasInstalledSelection = installedView->selectionModel()->hasSelection();
-    ui->openInstalledFolderButton->setEnabled(idle && hasInstalledSelection);
-    ui->toggleInstalledButton->setEnabled(idle && hasInstalledSelection);
-    ui->uninstallButton->setEnabled(idle && hasInstalledSelection);
-    modActivation->setEnabled(idle);
+    modsPage->setBlocked(!idle);
     progress->setVisible(engine.busy || diskBusy || pendingStart);
     if (current && current->progress >= 0) {
         progress->setRange(0, 100);
         progress->setValue(current->progress);
     } else
         progress->setRange(0, 0);
-    tabs->setTabText(2, QStringLiteral("Library (%1)").arg(library.items.size()));
+    setTaskbarProgress(this, engine.busy || diskBusy || pendingStart,
+                       current && current->progress >= 0 ? current->progress : -1);
+    if (closeRequested && !engine.busy && !diskBusy)
+        QTimer::singleShot(0, this, [this] { close(); });
+    tabs->setTabText(2, QStringLiteral("Mods (%1)").arg(library.items.size()));
+    tabs->setTabText(1, queue.items.isEmpty() ? QStringLiteral("Downloads")
+                                              : QStringLiteral("Downloads (%1)").arg(queue.items.size()));
+    ui->downloadTabs->setTabText(0, queue.items.isEmpty() ? QStringLiteral("Queue")
+                                                          : QStringLiteral("Queue (%1)").arg(queue.items.size()));
+    ui->browserDownloads->setTabText(0, ui->downloadTabs->tabText(0));
+    syncHistoryActions();
+    ui->accountStatus->setText(engine.username.isEmpty() ? QStringLiteral("Downloading anonymously")
+                                                         : QStringLiteral("Signed in as %1").arg(engine.username));
+    ui->accountButton->setEnabled(!engine.busy && !diskBusy);
     syncBrowser();
     maybeStartDownloads();
 }
@@ -559,6 +543,20 @@ void Window::maybeStartDownloads() {
         if (!ids.isEmpty()) {
             const bool reviewed = dependenciesReviewed;
             dependenciesReviewed = false;
+            QStringList unprompted;
+            for (const auto &app : engine.gamesNeedingAccount(ids))
+                if (!accountPrompted.contains(app)) {
+                    accountPrompted.insert(app);
+                    unprompted << gameName(app);
+                }
+            if (!unprompted.isEmpty() &&
+                QMessageBox::question(this, QStringLiteral("Sign in to Steam?"),
+                                      QStringLiteral("Anonymous downloads failed before for %1. Sign in with an "
+                                                     "account that owns the game?")
+                                          .arg(unprompted.join(QStringLiteral(", ")))) == QMessageBox::Yes)
+                accountDialog();
+            if (engine.busy || diskBusy)
+                return;
             if (!reviewed && engine.settings.value(QStringLiteral("checkDependencies"), false).toBool())
                 addDependencies(ids, true);
             else
@@ -580,6 +578,10 @@ void Window::importList() {
     addText(QString::fromUtf8(file.readAll()));
 }
 void Window::exportList() {
+    if (queue.items.isEmpty()) {
+        activity->setText(QStringLiteral("The queue is empty."));
+        return;
+    }
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export queue"),
                                                       QStringLiteral("Workshop-links.txt"),
                                                       QStringLiteral("Text files (*.txt)"));
@@ -608,7 +610,9 @@ void Window::appendLog(const QString &text) {
     QString clean = text;
     if (!engine.password.isEmpty())
         clean.replace(engine.password, QStringLiteral("[redacted]"));
-    log->appendPlainText(QTime::currentTime().toString(QStringLiteral("HH:mm:ss  ")) + clean);
+    const QString line = QTime::currentTime().toString(QStringLiteral("HH:mm:ss  ")) + clean;
+    log->appendPlainText(line);
+    emit logLine(line);
     QFile file(dataRoot() + QStringLiteral("/activity.log"));
     if (file.size() > 2 * 1024 * 1024) {
         QFile::remove(dataRoot() + QStringLiteral("/activity.previous.log"));
@@ -621,19 +625,26 @@ void Window::appendLog(const QString &text) {
                        .toUtf8());
 }
 void Window::showLog() {
-    QDialog dialog(this);
+    if (logDialog) {
+        logDialog->show();
+        logDialog->raise();
+        logDialog->activateWindow();
+        return;
+    }
+    auto *dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    logDialog = dialog;
     Ui::LogDialog form;
-    form.setupUi(&dialog);
+    form.setupUi(dialog);
     auto *view = form.view;
     view->setFont(log->font());
+    view->setMaximumBlockCount(log->maximumBlockCount());
     view->setPlainText(log->toPlainText());
-    connect(log, &QPlainTextEdit::textChanged, view, [this, view] {
-        view->setPlainText(log->toPlainText());
-        view->moveCursor(QTextCursor::End);
-    });
-    connect(form.copy, &QPushButton::clicked, &dialog,
+    view->moveCursor(QTextCursor::End);
+    connect(this, &Window::logLine, view, &QPlainTextEdit::appendPlainText);
+    connect(form.copy, &QPushButton::clicked, dialog,
             [view] { QApplication::clipboard()->setText(view->toPlainText()); });
-    connect(form.save, &QPushButton::clicked, &dialog, [this, view] {
+    connect(form.save, &QPushButton::clicked, dialog, [this, view] {
         const auto path = QFileDialog::getSaveFileName(this, QStringLiteral("Save activity log"),
                                                        QStringLiteral("WorkshopDL-activity.txt"),
                                                        QStringLiteral("Text files (*.txt)"));
@@ -644,6 +655,6 @@ void Window::showLog() {
         if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
             QMessageBox::warning(this, QStringLiteral("Save failed"), file.errorString());
     });
-    connect(form.close, &QPushButton::clicked, &dialog, &QDialog::accept);
-    dialog.exec();
+    connect(form.close, &QPushButton::clicked, dialog, &QDialog::accept);
+    dialog->show();
 }

@@ -1,8 +1,11 @@
 TEMPLATE = app
 TARGET = WorkshopDL
-VERSION = 1.0.0
+VERSION = 1.1.0
 QMAKE_TARGET_PRODUCT = WorkshopDL++
 QMAKE_TARGET_DESCRIPTION = Steam Workshop downloader
+QMAKE_TARGET_COMPANY = noitavo
+QMAKE_TARGET_COPYRIGHT = Copyright (c) 2022-2026 noitavo
+DEFINES += APP_VERSION=\\\"$$VERSION\\\"
 include(application.pri)
 RC_ICONS = $$PWD/assets/workshopdl.ico
 SOURCES += $$PWD/src/main.cpp

@@ -9,9 +9,15 @@ struct WorkshopEntry {
     QJsonObject details;
     QStringList children;
     QString error;
-    bool collection = false;
+    bool collection = false, transient = false;
 };
 using WorkshopEntries = QHash<QString, WorkshopEntry>;
+
+struct StoreGame {
+    QString id, name, image;
+};
+
+void applyWorkshopDetails(Item &item, const QJsonObject &details);
 
 class Engine : public QObject {
     Q_OBJECT
@@ -33,6 +39,15 @@ class Engine : public QObject {
     void prepareSteamcmd();
     bool needsSteamcmdSetup() const;
     void setSteamcmdPath(const QString &path);
+    QString apiKey() const;
+    bool setApiKey(const QString &key);
+    bool authPending() const;
+    bool inSession(const QString &id) const;
+    void signOut();
+    QStringList gamesNeedingAccount(const QStringList &ids) const;
+    void searchGames(const QString &term, QObject *context, std::function<void(QList<StoreGame>)> callback);
+    void lookupGame(const QString &id, QObject *context, std::function<void(QString, QString)> callback);
+    void backfillLibrary();
     void preview(const QStringList &ids, QObject *context,
                  std::function<void(QHash<QString, QJsonObject>, QString)> callback);
     void inspectWorkshop(const QStringList &ids, QObject *context,
@@ -47,9 +62,11 @@ class Engine : public QObject {
     void activity(const QString &text);
     void busyChanged(bool busy);
     void authRequired(const QString &prompt);
+    void authExpired();
     void collectionReady(const QString &id, const QString &title, const QStringList &children);
     void storageError(const QString &text);
     void itemSaved(const QString &id);
+    void historyChanged();
     void transferStatus(const QString &text);
     void setupProgress(const QString &text);
     void setupDownloadProgress(qint64 received, qint64 total);
@@ -60,9 +77,22 @@ class Engine : public QObject {
     QProcess process;
     QTimer timeout;
     QTimer retryTimer;
-    QString loadError;
+    QString loadError, webApiKey;
     QString active, outputBuffer, lineBuffer, phase, setupZip;
-    bool successSeen = false, cancelled = false, bootstrapping = false, authPrompted = false;
+    struct SessionResult {
+        QString id, error;
+        bool success = false, retry = false;
+    };
+    QStringList sessionIds;
+    QSet<QString> sessionDone, sessionStarted;
+    QHash<QString, QString> sessionErrors;
+    QHash<QString, qint64> sessionSeconds;
+    QList<SessionResult> sessionResults;
+    qint64 attemptSeconds = -1;
+    void beginSessionItem(const QString &id);
+    void abortSession(const QString &error);
+    QString failureText(const QString &output) const;
+    bool cancelled = false, bootstrapping = false, authPrompted = false;
     bool steamReady = false, clientReady = false;
     QString steamcmdKey() const;
     bool steamcmdInstalled() const;
@@ -71,7 +101,10 @@ class Engine : public QObject {
     QTimer transferTimer;
     QElapsedTimer attemptClock;
     qint64 lastOutput = 0, lastBytes = 0, lastSample = 0, transferBytes = -1;
-    QString attemptMethod;
+    qint64 transferBaseline = -1, lastFolderSample = 0;
+    int runTotal = 0;
+    QString attemptMethod, transferSpeed;
+    void resetTransfer();
     bool sampling = false;
     quint64 attemptGeneration = 0;
     void sampleTransfer();

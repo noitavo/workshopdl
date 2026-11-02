@@ -1,5 +1,8 @@
 #include "games.h"
 #include "gma.h"
+#include <algorithm>
+#include <qt_windows.h>
+#include <tlhelp32.h>
 
 QJsonObject readObject(const QString &path, QString *error) {
     if (error)
@@ -26,78 +29,154 @@ QJsonObject readObject(const QString &path, QString *error) {
 QJsonObject installedRecords(QString *error) {
     return readObject(dataRoot() + QStringLiteral("/installations.json"), error);
 }
+namespace {
+struct Catalog {
+    QRecursiveMutex lock;
+    QList<GameProfile> profiles;
+    bool profilesLoaded = false;
+    QJsonObject names;
+    bool namesLoaded = false;
+};
+Catalog &catalog() {
+    static Catalog instance;
+    return instance;
+}
+QString gameRulesPath() {
+    return dataRoot() + QStringLiteral("/games.json");
+}
+QString gameNamesPath() {
+    return dataRoot() + QStringLiteral("/cache/games.json");
+}
+GameProfile parseProfile(const QJsonObject &object) {
+    return {object.value(QStringLiteral("id")).toString(),
+            object.value(QStringLiteral("name")).toString(),
+            object.value(QStringLiteral("modFolder")).toString(),
+            object.value(QStringLiteral("format")).toString(QStringLiteral("manual")),
+            object.value(QStringLiteral("note")).toString(),
+            object.value(QStringLiteral("activation")).toString()};
+}
+QJsonObject profileObject(const GameProfile &profile) {
+    return {{QStringLiteral("id"), profile.id},
+            {QStringLiteral("name"), profile.name},
+            {QStringLiteral("modFolder"), profile.subdir},
+            {QStringLiteral("format"), profile.format},
+            {QStringLiteral("note"), profile.note},
+            {QStringLiteral("activation"), profile.activation}};
+}
+void mergeProfiles(QList<GameProfile> &profiles, const QJsonArray &rows) {
+    for (const auto &row : rows) {
+        const auto profile = parseProfile(row.toObject());
+        if (!validId(profile.id) || profile.name.isEmpty())
+            continue;
+        auto it = std::find_if(profiles.begin(), profiles.end(),
+                               [&profile](const GameProfile &p) { return p.id == profile.id; });
+        if (it != profiles.end())
+            *it = profile;
+        else
+            profiles.append(profile);
+    }
+}
+}
 QList<GameProfile> gameProfiles() {
-    return {
-        {QStringLiteral("4000"), QStringLiteral("Garry's Mod"), QStringLiteral("garrysmod/addons"),
-         QStringLiteral("gma"), QStringLiteral("GMA archives are extracted into addon folders.")},
-        {QStringLiteral("294100"), QStringLiteral("RimWorld"), QStringLiteral("Mods"),
-         QStringLiteral("rimworld"),
-         QStringLiteral("Folder mods with About/About.xml. Enable them in the game's Mods menu.")},
-        {QStringLiteral("440"), QStringLiteral("Team Fortress 2"), QStringLiteral("tf/custom"),
-         QStringLiteral("folder"),
-         QStringLiteral("Custom content folders. Some Workshop items cannot be installed.")},
-        {QStringLiteral("550"), QStringLiteral("Left 4 Dead 2"), QStringLiteral("left4dead2/addons"),
-         QStringLiteral("files:.vpk"), QStringLiteral("VPK addon packages.")},
-        {QStringLiteral("620"), QStringLiteral("Portal 2"), QStringLiteral("portal2/maps/workshop"),
-         QStringLiteral("portal"), QStringLiteral("BSP maps are kept in their Workshop item folder.")},
-        {QStringLiteral("108600"), QStringLiteral("Project Zomboid"), QStringLiteral("@home/Zomboid/mods"),
-         QStringLiteral("zomboid"), QStringLiteral("Requires mod.info. Enable mods in the game.")},
-        {QStringLiteral("107410"), QStringLiteral("Arma 3"), QStringLiteral("Mods"), QStringLiteral("folder"),
-         QStringLiteral("Add the installed folder to the Arma 3 launcher's watched folders.")},
-        {QStringLiteral("346110"), QStringLiteral("ARK: Survival Evolved"),
-         QStringLiteral("ShooterGame/Content/Mods"), QStringLiteral("ark"),
-         QStringLiteral(
-             "Requires a cooked item folder and matching .mod file. Convert raw packages with ARK's tools.")},
-        {QStringLiteral("211820"), QStringLiteral("Starbound"), QStringLiteral("mods"),
-         QStringLiteral("files:.pak"), QStringLiteral("PAK mod packages.")},
-        {QStringLiteral("219740"), QStringLiteral("Don't Starve"), QStringLiteral("mods"),
-         QStringLiteral("folder"), QStringLiteral("Local mod folders. Enable in game.")},
-        {QStringLiteral("322330"), QStringLiteral("Don't Starve Together"), QStringLiteral("mods"),
-         QStringLiteral("folder"),
-         QStringLiteral("Local client mods. Dedicated server configuration is separate.")},
-        {QStringLiteral("268500"), QStringLiteral("XCOM 2"), QStringLiteral("XComGame/Mods"),
-         QStringLiteral("folder"),
-         QStringLiteral("Local mod folders. For War of the Chosen choose its XComGame/Mods destination.")},
-        {QStringLiteral("304930"), QStringLiteral("Unturned"), QString(), QStringLiteral("manual"),
-         QStringLiteral(
-             "Client content is Steam-managed. Dedicated servers use WorkshopDownloadConfig.json.")},
-        {QStringLiteral("427520"), QStringLiteral("Factorio"), QStringLiteral("@roaming/Factorio/mods"),
-         QStringLiteral("files:.zip"),
-         QStringLiteral("Local ZIP packages only. Factorio does not use Steam Workshop.")},
-        {QStringLiteral("1281930"), QStringLiteral("tModLoader"),
-         QStringLiteral("@documents/My Games/Terraria/tModLoader/Mods"), QStringLiteral("files:.tmod"),
-         QStringLiteral("TMOD packages. Enable and reload them inside tModLoader.")},
-        {QStringLiteral("227300"), QStringLiteral("Euro Truck Simulator 2"),
-         QStringLiteral("@documents/Euro Truck Simulator 2/mod"), QStringLiteral("files:.scs,.zip"),
-         QStringLiteral("Local SCS/ZIP packages; activate them in the game's Mod Manager.")},
-        {QStringLiteral("270880"), QStringLiteral("American Truck Simulator"),
-         QStringLiteral("@documents/American Truck Simulator/mod"), QStringLiteral("files:.scs,.zip"),
-         QStringLiteral("Local SCS/ZIP packages; activate them in the game's Mod Manager.")},
-        {QStringLiteral("255710"), QStringLiteral("Cities: Skylines"),
-         QStringLiteral("@local/Colossal Order/Cities_Skylines"), QStringLiteral("manual"),
-         QStringLiteral("Install manually with the game's content tools; folders vary by content type.")},
-        {QStringLiteral("244850"), QStringLiteral("Space Engineers"),
-         QStringLiteral("@roaming/SpaceEngineers/Mods"), QStringLiteral("folder"),
-         QStringLiteral("Local mod folders. Add them to the world from the game's mod menu.")},
-        {QStringLiteral("286160"), QStringLiteral("Tabletop Simulator"),
-         QStringLiteral("@documents/My Games/Tabletop Simulator"), QStringLiteral("tabletop"),
-         QStringLiteral("JSON saves. The game downloads referenced assets.")},
-        {QStringLiteral("431960"), QStringLiteral("Wallpaper Engine"), QStringLiteral("projects/backup"),
-         QStringLiteral("folder"),
-         QStringLiteral("Offline project backups. Import the backup through Wallpaper Engine.")}};
+    auto &c = catalog();
+    QMutexLocker locker(&c.lock);
+    if (!c.profilesLoaded) {
+        c.profiles.clear();
+        mergeProfiles(c.profiles,
+                      readObject(QStringLiteral(":/data/games.json")).value(QStringLiteral("games")).toArray());
+        mergeProfiles(c.profiles, readObject(gameRulesPath()).value(QStringLiteral("games")).toArray());
+        c.profilesLoaded = true;
+    }
+    return c.profiles;
+}
+bool hasProfile(const QString &id) {
+    const auto profiles = gameProfiles();
+    return std::any_of(profiles.cbegin(), profiles.cend(), [&id](const GameProfile &p) { return p.id == id; });
 }
 GameProfile profileFor(const QString &id) {
     for (const auto &p : gameProfiles())
         if (p.id == id)
             return p;
     return {id,
-            QStringLiteral("Steam app ") + id,
+            gameName(id),
             {},
             QStringLiteral("manual"),
-            QStringLiteral("Install manually. Open the folder and follow the game's mod instructions.")};
+            QStringLiteral("Download only. Open the folder and follow the game's mod instructions, or set a mod "
+                           "folder to install from here."),
+            {}};
+}
+QString supportLevel(const GameProfile &profile) {
+    if (!profile.activation.isEmpty())
+        return QStringLiteral("Full");
+    return profile.format == QStringLiteral("manual") ? QStringLiteral("Download only")
+                                                      : QStringLiteral("Install");
+}
+bool saveGameRule(const GameProfile &profile, QString *error) {
+    auto &c = catalog();
+    QMutexLocker locker(&c.lock);
+    auto rows = readObject(gameRulesPath(), error).value(QStringLiteral("games")).toArray();
+    if (error && !error->isEmpty())
+        return false;
+    for (int n = int(rows.size()) - 1; n >= 0; --n)
+        if (rows[n].toObject().value(QStringLiteral("id")).toString() == profile.id)
+            rows.removeAt(n);
+    rows.append(profileObject(profile));
+    if (!writeJson(gameRulesPath(), QJsonDocument(QJsonObject{{QStringLiteral("games"), rows}}), error))
+        return false;
+    c.profilesLoaded = false;
+    return true;
+}
+QString knownGameName(const QString &id) {
+    auto &c = catalog();
+    QMutexLocker locker(&c.lock);
+    if (!c.namesLoaded) {
+        c.names = readObject(gameNamesPath());
+        c.namesLoaded = true;
+    }
+    return c.names.value(id).toObject().value(QStringLiteral("name")).toString();
+}
+QString knownGameImage(const QString &id) {
+    knownGameName(id);
+    auto &c = catalog();
+    QMutexLocker locker(&c.lock);
+    return c.names.value(id).toObject().value(QStringLiteral("image")).toString();
+}
+void rememberGame(const QString &id, const QString &name, const QString &image) {
+    knownGameName(id);
+    auto &c = catalog();
+    QMutexLocker locker(&c.lock);
+    c.names.insert(id, QJsonObject{{QStringLiteral("name"), name}, {QStringLiteral("image"), image}});
+    QDir().mkpath(QFileInfo(gameNamesPath()).absolutePath());
+    writeJson(gameNamesPath(), QJsonDocument(c.names));
+}
+bool gameRunning(const QString &folder) {
+    if (folder.isEmpty())
+        return false;
+    const QString prefix = QDir::toNativeSeparators(QDir::cleanPath(folder)) + QLatin1Char('\\');
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return false;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool running = false;
+    for (BOOL more = Process32FirstW(snapshot, &entry); more && !running;
+         more = Process32NextW(snapshot, &entry)) {
+        const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        if (!process)
+            continue;
+        wchar_t path[MAX_PATH * 4];
+        DWORD size = MAX_PATH * 4;
+        if (QueryFullProcessImageNameW(process, 0, path, &size))
+            running = QString::fromWCharArray(path, int(size)).startsWith(prefix, Qt::CaseInsensitive);
+        CloseHandle(process);
+    }
+    CloseHandle(snapshot);
+    return running;
 }
 QString gameDestination(const QString &id, const QString &folder) {
     QString subdir = profileFor(id).subdir;
+    if (subdir.isEmpty())
+        return {};
     const QHash<QString, QString> roots{
         {QStringLiteral("@home"), QDir::homePath()},
         {QStringLiteral("@documents"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)},
@@ -214,7 +293,7 @@ QString hashPath(const QString &path) {
         if (linkedAncestor(file))
             return {};
         hash.addData(QDir(path).relativeFilePath(file).toUtf8());
-        hash.addData("\0", 1);
+        hash.addData(QByteArrayView("\0", 1));
         QFile f(file);
         if (!f.open(QIODevice::ReadOnly))
             return {};
@@ -227,6 +306,26 @@ QString hashPath(const QString &path) {
     }
     return QString::fromLatin1(hash.result().toHex());
 }
+}
+QString fingerprintPath(const QString &path) {
+    qint64 count = 0, bytes = 0, newest = 0;
+    const auto add = [&](const QFileInfo &info) {
+        ++count;
+        bytes += info.size();
+        newest = qMax(newest, info.lastModified().toSecsSinceEpoch());
+    };
+    if (QFileInfo(path).isFile())
+        add(QFileInfo(path));
+    else {
+        QDirIterator it(path, QDir::Files | QDir::Hidden | QDir::System, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            it.next();
+            add(it.fileInfo());
+        }
+    }
+    return QStringLiteral("%1:%2:%3").arg(count).arg(bytes).arg(newest);
+}
+namespace {
 bool containsPath(const QString &root, const QString &path) {
     const QString relative = QDir(root).relativeFilePath(path);
     return relative != QStringLiteral("..") && !relative.startsWith(QStringLiteral("../")) &&
@@ -259,7 +358,7 @@ QString transaction(const QString &key, const QJsonObject &record, const QJsonAr
         const QString from = m.value(QStringLiteral("from")).toString(),
                       to = m.value(QStringLiteral("to")).toString();
         if (linkedAncestor(from) || linkedAncestor(to) || !QDir().mkpath(QFileInfo(to).absolutePath()) ||
-            !QDir().rename(from, to)) {
+            !renamePath(from, to)) {
             error = QStringLiteral("Could not move %1. Close the game and check permissions.")
                         .arg(QFileInfo(from).fileName());
             break;
@@ -378,7 +477,7 @@ QString recoverInstallations() {
                      failures.join(QStringLiteral(", "));
 }
 
-QString installContent(const Item &item, const QString &destination) {
+QString installContent(const Item &item, const QString &destination, bool overwrite) {
     const auto profile = profileFor(item.appId);
     if (profile.format == QStringLiteral("manual"))
         return profile.note;
@@ -499,14 +598,14 @@ QString installContent(const Item &item, const QString &destination) {
         const QString full = root + QLatin1Char('/') + path;
         if (!containsPath(root, full) || linkedAncestor(full))
             return fail(QStringLiteral("Installation records contain an unsafe path."));
-        if (QFileInfo::exists(full) && hashPath(full) != oldHashes.value(path).toString())
+        if (!overwrite && QFileInfo::exists(full) && hashPath(full) != oldHashes.value(path).toString())
             return fail(
                 QStringLiteral(
                     "Installed files were modified. Keep or move those changes before replacing this mod: ") +
                 path);
     }
     QJsonArray paths;
-    QJsonObject hashes;
+    QJsonObject hashes, fingerprints;
     QJsonArray moves;
     auto move = [&](const QString &from, const QString &to) {
         moves.append(QJsonObject{{QStringLiteral("from"), from}, {QStringLiteral("to"), to}});
@@ -529,6 +628,7 @@ QString installContent(const Item &item, const QString &destination) {
             return fail(QStringLiteral("Could not verify staged content."));
         paths.append(source.second);
         hashes.insert(source.second, hash);
+        fingerprints.insert(source.second, fingerprintPath(staged));
     }
     index = 0;
     for (const auto &path : oldPaths)
@@ -544,6 +644,8 @@ QString installContent(const Item &item, const QString &destination) {
         {QStringLiteral("root"), root},
         {QStringLiteral("paths"), paths},
         {QStringLiteral("hashes"), hashes},
+        {QStringLiteral("fingerprints"), fingerprints},
+        {QStringLiteral("updated"), QString::number(item.updated)},
         {QStringLiteral("disabled"), false},
         {QStringLiteral("installedAt"), QString::number(QDateTime::currentSecsSinceEpoch())}};
     return transaction(key, record, moves, {staging});

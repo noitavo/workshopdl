@@ -13,6 +13,14 @@ Engine::Engine(ItemModel *q, ItemModel *l, QObject *parent)
         steamExe = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(steamExe);
     steamReady = steamcmdInstalled();
     username = settings.value(QStringLiteral("username")).toString();
+    const QString legacyKey = settings.value(QStringLiteral("apiKey")).toString();
+    if (legacyKey.isEmpty())
+        webApiKey = savedApiKey();
+    else {
+        webApiKey = legacyKey;
+        if (storeApiKey(legacyKey))
+            settings.remove(QStringLiteral("apiKey"));
+    }
     const QString queueError = queue->load(dataRoot() + QStringLiteral("/queue.json"), true);
     const QString libraryError = library->load(dataRoot() + QStringLiteral("/library.json"), false);
     QStringList errors{queueError, libraryError};
@@ -34,13 +42,13 @@ Engine::Engine(ItemModel *q, ItemModel *l, QObject *parent)
             if (bootstrapping) {
                 finishSetup(QStringLiteral("SteamCMD could not start: ") + process.errorString());
             } else
-                fail(QStringLiteral("SteamCMD could not start: ") + process.errorString());
+                abortSession(QStringLiteral("SteamCMD could not start: ") + process.errorString());
         }
     });
     timeout.setSingleShot(true);
     retryTimer.setSingleShot(true);
     connect(&retryTimer, &QTimer::timeout, this, &Engine::next);
-    transferTimer.setInterval(5000);
+    transferTimer.setInterval(1000);
     connect(&transferTimer, &QTimer::timeout, this, &Engine::sampleTransfer);
     connect(&timeout, &QTimer::timeout, this, [this] {
         timedOut = true;
@@ -62,18 +70,94 @@ void Engine::persist() {
 QString Engine::stateLoadError() const {
     return loadError;
 }
+QString Engine::apiKey() const {
+    return webApiKey;
+}
+bool Engine::setApiKey(const QString &key) {
+    if (key == webApiKey)
+        return true;
+    if (!storeApiKey(key))
+        return false;
+    webApiKey = key;
+    settings.remove(QStringLiteral("apiKey"));
+    return true;
+}
+bool Engine::inSession(const QString &id) const {
+    if (!busy)
+        return false;
+    return id == active || sessionIds.contains(id) ||
+           std::any_of(sessionResults.cbegin(), sessionResults.cend(),
+                       [&id](const SessionResult &result) { return result.id == id; });
+}
+bool Engine::authPending() const {
+    return busy && authPrompted && !bootstrapping && process.state() == QProcess::Running;
+}
+void Engine::signOut() {
+    username.clear();
+    password.clear();
+    secrets.clear();
+    forgetPassword();
+    settings.remove(QStringLiteral("username"));
+    QFile::remove(QFileInfo(steamExe).absolutePath() + QStringLiteral("/config/config.vdf"));
+}
+QStringList Engine::gamesNeedingAccount(const QStringList &ids) const {
+    QStringList games;
+    if (!username.isEmpty())
+        return games;
+    for (const auto &id : ids)
+        if (const auto *item = queue->get(id);
+            item && settings.value(QStringLiteral("requiresAccount/") + item->appId, false).toBool())
+            games << item->appId;
+    games.removeDuplicates();
+    return games;
+}
+void Engine::beginSessionItem(const QString &id) {
+    phase = QStringLiteral("download");
+    timeout.stop();
+    sessionStarted.insert(id);
+    if (id == active)
+        return;
+    if (!active.isEmpty() && attemptClock.isValid() && !sessionSeconds.contains(active))
+        sessionSeconds.insert(active, attemptClock.elapsed() / 1000);
+    active = id;
+    attemptClock.restart();
+    ++attemptGeneration;
+    resetTransfer();
+    if (auto *item = queue->get(id)) {
+        item->status = QStringLiteral("Downloading");
+        item->progress = -1;
+        queue->changed(id);
+        emit activity(QStringLiteral("Downloading · ") + (item->title.isEmpty() ? id : item->title));
+    }
+}
+void Engine::abortSession(const QString &error) {
+    const QStringList ids = sessionIds;
+    sessionIds.clear();
+    if (ids.isEmpty()) {
+        fail(error);
+        return;
+    }
+    for (const auto &id : ids)
+        sessionResults.append({id, error, false, false});
+    active.clear();
+    next();
+}
+void Engine::resetTransfer() {
+    transferBytes = transferBaseline = -1;
+    lastBytes = lastSample = lastOutput = lastFolderSample = 0;
+    transferSpeed.clear();
+}
 void Engine::api(const QString &method, const QUrlQuery &form,
                  std::function<void(QJsonObject, QString)> callback) {
     QNetworkRequest request(QUrl(QStringLiteral("https://api.steampowered.com/ISteamRemoteStorage/") +
                                  method + QStringLiteral("/v1/")));
     request.setHeader(QNetworkRequest::ContentTypeHeader,
                       QStringLiteral("application/x-www-form-urlencoded"));
-    request.setRawHeader("User-Agent", "WorkshopDL++/1.0");
+    request.setRawHeader("User-Agent", "WorkshopDL++/" APP_VERSION);
     request.setTransferTimeout(30000);
     auto values = form;
-    const auto key = settings.value(QStringLiteral("apiKey")).toString();
-    if (!key.isEmpty())
-        values.addQueryItem(QStringLiteral("key"), key);
+    if (!webApiKey.isEmpty())
+        values.addQueryItem(QStringLiteral("key"), webApiKey);
     auto *reply = network.post(request, values.query(QUrl::FullyEncoded).toUtf8());
     connect(reply, &QNetworkReply::downloadProgress, reply, [reply](qint64 received, qint64) {
         if (received > 8 * 1024 * 1024)
@@ -118,9 +202,6 @@ void Engine::resolve(const QStringList &ids) {
             if (!queue->add(i))
                 continue;
         }
-        if (const auto *existing = queue->get(id);
-            existing && existing->status == QStringLiteral("Completed"))
-            queue->moveItem(id, queue->rowCount() - 1 - queue->find(id));
         auto *i = queue->get(id);
         i->status = QStringLiteral("Resolving");
         i->error.clear();
@@ -144,15 +225,17 @@ void Engine::resolve(const QStringList &ids) {
                     const bool collection = entry.collection ||
                                             o.value(QStringLiteral("file_type")).toVariant().toInt() == 2 ||
                                             o.value(QStringLiteral("filetype")).toVariant().toInt() == 2;
-                    if (i->manualAppId && validId(i->appId) && !collection &&
+                    if ((i->manualAppId || entry.transient) && validId(i->appId) && !collection &&
                         settings.value(QStringLiteral("method")).toString() != QStringLiteral("http")) {
                         i->status = QStringLiteral("Ready");
-                        i->fileUrl.clear();
-                        i->filename.clear();
-                        i->size = 0;
-                        i->updated = 0;
-                        emit message(QStringLiteral("Metadata lookup failed for %1; using the manually "
-                                                    "assigned App ID %2 with SteamCMD. %3")
+                        if (!entry.transient) {
+                            i->fileUrl.clear();
+                            i->filename.clear();
+                            i->size = 0;
+                            i->updated = 0;
+                        }
+                        emit message(QStringLiteral("Metadata lookup failed for %1; using App ID %2 with "
+                                                    "SteamCMD. %3")
                                          .arg(id, i->appId, entry.error));
                     } else {
                         i->status = QStringLiteral("Failed");
@@ -183,6 +266,7 @@ void Engine::resolve(const QStringList &ids) {
                     i->updated = o.value(QStringLiteral("time_updated")).toInteger();
                     i->fileUrl = o.value(QStringLiteral("file_url")).toString();
                     i->filename = o.value(QStringLiteral("filename")).toString();
+                    applyWorkshopDetails(*i, o);
                     i->status = validId(i->appId) ? QStringLiteral("Ready") : QStringLiteral("Failed");
                     if (i->status == QStringLiteral("Failed"))
                         i->error = QStringLiteral(
@@ -208,8 +292,9 @@ void Engine::start(const QStringList &only) {
     retries.clear();
     succeededCount = 0;
     failedCount = 0;
+    const QSet<QString> wanted(only.cbegin(), only.cend());
     for (const auto &i : queue->items)
-        if ((only.isEmpty() || only.contains(i.id)) &&
+        if ((only.isEmpty() || wanted.contains(i.id)) &&
             (i.status == QStringLiteral("Ready") || i.status == QStringLiteral("Cancelled")) &&
             validId(i.appId))
             runIds.append(i.id);
@@ -217,6 +302,7 @@ void Engine::start(const QStringList &only) {
         emit activity(QStringLiteral("Add items or retry failed entries first."));
         return;
     }
+    runTotal = int(runIds.size());
     busy = true;
     retryRequested = false;
     stopAfter = false;
@@ -301,8 +387,8 @@ void Engine::updateSteamcmd() {
         return;
     }
     process.setWorkingDirectory(QFileInfo(steamExe).absolutePath());
-    process.start(steamExe, {QStringLiteral("+quit")});
     timeout.start(15 * 60 * 1000);
+    process.start(steamExe, {QStringLiteral("+quit")});
 }
 void Engine::finishSetup(const QString &error) {
     timeout.stop();
@@ -367,6 +453,9 @@ void Engine::bootstrap() {
     });
     connect(reply, &QNetworkReply::finished, this, [this, reply, file, toolDir, downloadError] {
         reply->deleteLater();
+        const auto remainder = reply->readAll();
+        if (downloadError->isEmpty() && file->write(remainder) != remainder.size())
+            *downloadError = file->errorString();
         if (downloadError->isEmpty() && reply->error() != QNetworkReply::NoError)
             *downloadError = reply->errorString();
         if (!cancelled && downloadError->isEmpty() && !file->commit())
@@ -382,24 +471,39 @@ void Engine::bootstrap() {
         outputBuffer.clear();
         lineBuffer.clear();
         emit activity(QStringLiteral("Setting up SteamCMD…"));
-        auto quote = [](QString s) { return s.replace(QLatin1Char('\''), QStringLiteral("''")); };
-        const QString command = QStringLiteral("$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath "
-                                               "'%1' -DestinationPath '%2' -Force")
-                                    .arg(quote(setupZip), quote(toolDir));
-        process.start(QStringLiteral("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
-                      {QStringLiteral("-NoProfile"), QStringLiteral("-NonInteractive"),
-                       QStringLiteral("-Command"), command});
+        process.setWorkingDirectory(toolDir);
         timeout.start(120000);
+        process.start(qEnvironmentVariable("SystemRoot", QStringLiteral("C:/Windows")) +
+                          QStringLiteral("/System32/tar.exe"),
+                      {QStringLiteral("-xf"), QFileInfo(setupZip).fileName()});
     });
 }
 void Engine::next() {
     if (!busy)
         return;
+    if (!sessionResults.isEmpty()) {
+        const auto result = sessionResults.takeFirst();
+        active = result.id;
+        phase = QStringLiteral("session");
+        triedDirect = false;
+        directSource.clear();
+        attemptMethod = QStringLiteral("SteamCMD");
+        attemptClock.start();
+        attemptSeconds = sessionSeconds.value(active, -1);
+        if (!queue->get(active))
+            QTimer::singleShot(0, this, &Engine::next);
+        else if (result.success)
+            commit();
+        else
+            fail(result.error, result.retry);
+        return;
+    }
     if (stopAfter || cancelled || runIds.isEmpty()) {
         finishRun();
         return;
     }
     active = runIds.takeFirst();
+    phase.clear();
     triedDirect = false;
     directSource.clear();
     const auto *i = queue->get(active);
@@ -410,8 +514,8 @@ void Engine::next() {
     attempts = retries.value(active, 0);
     attemptClock.start();
     ++attemptGeneration;
-    lastOutput = lastBytes = lastSample = 0;
-    transferBytes = -1;
+    resetTransfer();
+    attemptSeconds = -1;
     attemptMethod = QStringLiteral("SteamCMD");
     transferTimer.start();
     launch();
@@ -443,29 +547,54 @@ void Engine::launch() {
         fail(QStringLiteral("Not enough disk space for the download and saved copy."));
         return;
     }
+    sessionIds = {active};
+    sessionDone.clear();
+    sessionStarted = {active};
+    sessionErrors.clear();
+    sessionSeconds.clear();
+    if (retries.value(active) == 0) {
+        const qint64 reserveFactor = sameVolume ? 2 : 1;
+        const qint64 budget =
+            qMin(qint64(8) * 1024 * 1024 * 1024,
+                 volume.isValid() && volume.bytesAvailable() > 0 ? volume.bytesAvailable() / reserveFactor
+                                                                 : qint64(8) * 1024 * 1024 * 1024);
+        qint64 planned = qMax(qint64(0), i->size);
+        while (!runIds.isEmpty() && sessionIds.size() < 20) {
+            const auto *candidate = queue->get(runIds.first());
+            if (!candidate || retries.value(candidate->id) != 0 || planned + qMax(qint64(0), candidate->size) > budget)
+                break;
+            planned += qMax(qint64(0), candidate->size);
+            sessionIds << runIds.takeFirst();
+        }
+    }
     i->status = QStringLiteral("Downloading");
     i->error.clear();
     i->progress = -1;
     queue->changed(active);
     outputBuffer.clear();
     lineBuffer.clear();
-    successSeen = false;
     authPrompted = false;
     passwordSubmitted = false;
     timedOut = false;
     phase = QStringLiteral("login");
     process.setWorkingDirectory(QFileInfo(steamExe).absolutePath());
-    QStringList args{QStringLiteral("+login"), username.isEmpty() ? QStringLiteral("anonymous") : username,
-                     QStringLiteral("+workshop_download_item"), i->appId, i->id};
-    if (settings.value(QStringLiteral("validateDownloads"), true).toBool())
-        args << QStringLiteral("validate");
+    QStringList args{QStringLiteral("+login"), username.isEmpty() ? QStringLiteral("anonymous") : username};
+    const bool validate = settings.value(QStringLiteral("validateDownloads"), true).toBool();
+    for (const auto &id : sessionIds) {
+        const auto *member = queue->get(id);
+        args << QStringLiteral("+workshop_download_item") << member->appId << id;
+        if (validate)
+            args << QStringLiteral("validate");
+    }
     args << QStringLiteral("+quit");
     emit activity(QStringLiteral("Connecting · ") + (i->title.isEmpty() ? i->id : i->title));
-    emit message(QStringLiteral("Downloading %1 for %2%3")
-                     .arg(i->id, gameName(i->appId), attempts ? QStringLiteral(" (retry)") : QString()));
-    process.start(steamExe, args);
-    timeout.start(180000);
+    emit message(sessionIds.size() > 1
+                     ? QStringLiteral("Downloading %1 items in one SteamCMD session").arg(sessionIds.size())
+                     : QStringLiteral("Downloading %1 for %2%3")
+                           .arg(i->id, gameName(i->appId), attempts ? QStringLiteral(" (retry)") : QString()));
     persist();
+    timeout.start(180000);
+    process.start(steamExe, args);
 }
 void Engine::submitInput(const QString &input) {
     if (!busy || process.state() != QProcess::Running || input.contains(QLatin1Char('\n')) ||
@@ -486,9 +615,13 @@ void Engine::readOutput() {
         lineBuffer = lineBuffer.right(32768);
     static const QRegularExpression downloading(QStringLiteral("Downloading item ([0-9]+)\\b"),
                                                 QRegularExpression::CaseInsensitiveOption);
-    if (!bootstrapping && busy && !active.isEmpty() && downloading.match(lineBuffer).captured(1) == active) {
-        phase = QStringLiteral("download");
-        timeout.stop();
+    if (!bootstrapping && busy && !sessionIds.isEmpty()) {
+        auto starts = downloading.globalMatch(lineBuffer);
+        QString newest;
+        while (starts.hasNext())
+            newest = starts.next().captured(1);
+        if (sessionIds.contains(newest) && !sessionDone.contains(newest))
+            beginSessionItem(newest);
     }
     while (true) {
         const auto match = QRegularExpression(QStringLiteral("[\\r\\n]")).match(lineBuffer);
@@ -544,10 +677,10 @@ void Engine::handleLine(const QString &raw) {
     }
     static const QRegularExpression downloading(QStringLiteral("Downloading item ([0-9]+)\\b"),
                                                 QRegularExpression::CaseInsensitiveOption);
-    if (downloading.match(line).captured(1) == active) {
-        phase = QStringLiteral("download");
-        timeout.stop();
-    } else if (phase == QStringLiteral("login") && !authPrompted && !cancelled && !timedOut)
+    const QString started = downloading.match(line).captured(1);
+    if (sessionIds.contains(started) && !sessionDone.contains(started))
+        beginSessionItem(started);
+    else if (phase == QStringLiteral("login") && !authPrompted && !cancelled && !timedOut)
         timeout.start(180000);
     handleAuthPrompt(line);
     if (phase == QStringLiteral("login") &&
@@ -556,13 +689,28 @@ void Engine::handleLine(const QString &raw) {
         process.kill();
     static const QRegularExpression success(QStringLiteral("Success\\. Downloaded item ([0-9]+)"),
                                             QRegularExpression::CaseInsensitiveOption);
-    if (!active.isEmpty() && success.match(line).captured(1) == active) {
-        successSeen = true;
+    const QString succeeded = success.match(line).captured(1);
+    if (sessionIds.contains(succeeded)) {
+        sessionDone.insert(succeeded);
         timeout.stop();
+        if (succeeded == active && attemptClock.isValid())
+            sessionSeconds.insert(succeeded, attemptClock.elapsed() / 1000);
+        if (auto *item = queue->get(succeeded)) {
+            item->status = QStringLiteral("Verifying");
+            item->progress = -1;
+            queue->changed(succeeded);
+        }
+        if (stopAfter && sessionDone.size() < sessionIds.size())
+            process.kill();
     }
+    static const QRegularExpression itemFailure(QStringLiteral("ERROR! Download item ([0-9]+) failed \\(([^)]*)\\)"),
+                                                QRegularExpression::CaseInsensitiveOption);
+    const auto failure = itemFailure.match(line);
+    if (failure.hasMatch() && sessionIds.contains(failure.captured(1)))
+        sessionErrors.insert(failure.captured(1), failure.captured(2));
     static const QRegularExpression pct(QStringLiteral("([0-9]+(?:\\.[0-9]+)?)%"));
     const auto match = pct.match(line);
-    if (match.hasMatch())
+    if (match.hasMatch() && phase == QStringLiteral("download"))
         if (auto *i = queue->get(active)) {
             i->progress = qBound(0, int(match.captured(1).toDouble()), 100);
             queue->changed(active);
@@ -574,6 +722,7 @@ void Engine::handleLine(const QString &raw) {
 }
 void Engine::finished(int exitCode, QProcess::ExitStatus status) {
     timeout.stop();
+    emit authExpired();
     readOutput();
     if (!lineBuffer.isEmpty()) {
         handleLine(lineBuffer);
@@ -613,48 +762,71 @@ void Engine::finished(int exitCode, QProcess::ExitStatus status) {
         }
         return;
     }
-    if (!busy || active.isEmpty())
+    if (!busy || sessionIds.isEmpty())
         return;
-    if (retryRequested) {
-        retryRequested = false;
-        fail(QStringLiteral("Retry requested."), true);
-        return;
-    }
-    if (cancelled) {
-        fail(QStringLiteral("Cancelled"));
-        return;
-    }
-    if (timedOut) {
-        fail(QStringLiteral("SteamCMD timed out before starting the download."), true);
-        return;
-    }
-    if (successSeen && status == QProcess::NormalExit) {
-        if (exitCode != 0)
-            emit message(
-                QStringLiteral(
-                    "SteamCMD reported the item downloaded; verifying its files despite exit code %1.")
-                    .arg(exitCode));
-        commit();
-        return;
-    }
-    QString error = downloadError();
+    const QStringList session = sessionIds;
+    sessionIds.clear();
+    active.clear();
     const QString out = outputBuffer.toLower();
-    if (status == QProcess::NormalExit && out.contains(QStringLiteral("update complete")) &&
-        retries.value(active) < 2) {
+    const bool nothingReported = sessionDone.isEmpty() && sessionErrors.isEmpty();
+    if (!cancelled && !retryRequested && !timedOut && nothingReported && status == QProcess::NormalExit &&
+        out.contains(QStringLiteral("update complete")) && retries.value(session.first()) < 2) {
         emit message(
-            QStringLiteral("SteamCMD updated before downloading. Preparing it and retrying the item…"));
-        retries[active]++;
-        if (auto *item = queue->get(active)) {
-            item->status = QStringLiteral("Ready");
-            queue->changed(active);
+            QStringLiteral("SteamCMD updated before downloading. Preparing it and retrying the items…"));
+        for (auto it = session.crbegin(); it != session.crend(); ++it) {
+            retries[*it]++;
+            if (auto *item = queue->get(*it)) {
+                item->status = QStringLiteral("Ready");
+                queue->changed(*it);
+            }
+            runIds.prepend(*it);
         }
-        runIds.prepend(active);
-        active.clear();
         setupAttempts = 0;
         updateSteamcmd();
         return;
     }
-    fail(error, out.contains(QStringLiteral("timeout")) || out.contains(QStringLiteral("connection")));
+    if (exitCode != 0 && !sessionDone.isEmpty())
+        emit message(QStringLiteral("SteamCMD exited with code %1 after reporting downloads; verifying their files.")
+                         .arg(exitCode));
+    const bool retryAll = retryRequested;
+    retryRequested = false;
+    const bool transientOutput = out.contains(QStringLiteral("timeout")) || out.contains(QStringLiteral("connection"));
+    for (const auto &id : session) {
+        SessionResult result;
+        result.id = id;
+        if (sessionDone.contains(id)) {
+            result.success = true;
+        } else if (!retryAll && !sessionErrors.contains(id) &&
+                   ((stopAfter && !cancelled) || (cancelled && !sessionStarted.contains(id)))) {
+            if (auto *item = queue->get(id)) {
+                item->status = QStringLiteral("Ready");
+                item->progress = -1;
+                queue->changed(id);
+            }
+            continue;
+        } else if (retryAll) {
+            retries[id] = 0;
+            result.error = QStringLiteral("Retry requested.");
+            result.retry = true;
+        } else if (cancelled) {
+            result.error = QStringLiteral("Cancelled");
+        } else if (sessionErrors.contains(id)) {
+            const QString reason = sessionErrors.value(id).toLower();
+            result.error = failureText(reason);
+            result.retry = reason.contains(QStringLiteral("timeout")) || reason.contains(QStringLiteral("connection"));
+        } else if (timedOut) {
+            result.error = QStringLiteral("SteamCMD timed out before starting the download.");
+            result.retry = true;
+        } else {
+            result.error = downloadError();
+            result.retry = transientOutput;
+        }
+        if (!result.success && !result.retry && !cancelled && username.isEmpty())
+            if (const auto *item = queue->get(id))
+                settings.setValue(QStringLiteral("requiresAccount/") + item->appId, true);
+        sessionResults.append(result);
+    }
+    next();
 }
 void Engine::commit() {
     phase = QStringLiteral("commit");
@@ -673,6 +845,9 @@ void Engine::commit() {
                                                   : directSource;
     const QString target =
         QDir(root).absolutePath() + QLatin1Char('/') + item.appId + QLatin1Char('/') + item.id;
+    const QString directStage = directSource;
+    const bool dropSteamCopy =
+        directStage.isEmpty() && settings.value(QStringLiteral("removeSteamCopy"), false).toBool();
     auto *watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, target, item] {
         const QString error = watcher->result();
@@ -702,19 +877,18 @@ void Engine::commit() {
                      .arg(target));
             return;
         }
-        if (auto *current = queue->get(item.id)) {
-            *current = completed;
-            queue->changed(item.id);
-        }
         ++succeededCount;
+        if (username.isEmpty())
+            settings.remove(QStringLiteral("requiresAccount/") + item.appId);
         recordAttempt(QStringLiteral("Completed"));
+        queue->removeIds({item.id});
         emit message(QStringLiteral("Saved ") + target);
         persist();
         emit itemSaved(item.id);
         active.clear();
         next();
     });
-    watcher->setFuture(QtConcurrent::run([source, target] {
+    watcher->setFuture(QtConcurrent::run([source, target, directStage, dropSteamCopy] {
         QString error;
         if (!safeTree(source, &error))
             return error;
@@ -722,7 +896,7 @@ void Engine::commit() {
         const QString backup = target + QStringLiteral(".previous");
         if (linkedAncestor(target) || linkedAncestor(stage) || linkedAncestor(backup))
             return QStringLiteral("A managed path was replaced by a linked directory.");
-        if (!QFileInfo::exists(target) && QDir(backup).exists() && !QDir().rename(backup, target))
+        if (!QFileInfo::exists(target) && QDir(backup).exists() && !renamePath(backup, target))
             return QStringLiteral("Could not restore the previous download.");
         if (QDir(stage).exists() && !QDir(stage).removeRecursively())
             return QStringLiteral("Cannot clear incomplete download.");
@@ -731,15 +905,19 @@ void Engine::commit() {
         if (QDir(backup).exists() && !QDir(backup).removeRecursively())
             return QStringLiteral("Cannot remove previous backup.");
         const bool existed = QDir(target).exists();
-        if (existed && !QDir().rename(target, backup))
+        if (existed && !renamePath(target, backup))
             return QStringLiteral("Cannot replace the download. Close applications using its files.");
-        if (!QDir().rename(stage, target)) {
+        if (!renamePath(stage, target)) {
             if (existed)
-                QDir().rename(backup, target);
+                renamePath(backup, target);
             return QStringLiteral("Cannot publish the downloaded files.");
         }
         if (existed)
             QDir(backup).removeRecursively();
+        if (!directStage.isEmpty())
+            QDir(directStage).removeRecursively();
+        if (dropSteamCopy && !linkedAncestor(source))
+            removeSteamCopy(source);
         return QString();
     }));
 }
@@ -753,13 +931,13 @@ void Engine::fail(const QString &error, bool retry) {
             recordAttempt(QStringLiteral("Failed"), error);
             attemptClock.restart();
             ++attemptGeneration;
-            transferBytes = -1;
-            lastBytes = lastSample = lastOutput = 0;
+            resetTransfer();
             emit message(error + QStringLiteral(" Trying the file URL supplied by Steam."));
             directDownload();
             return;
         }
     }
+    bool requeued = false;
     if (auto *i = queue->get(active)) {
         i->error = error;
         i->status = cancelled ? QStringLiteral("Cancelled") : QStringLiteral("Failed");
@@ -769,20 +947,22 @@ void Engine::fail(const QString &error, bool retry) {
             retries[active]++;
             i->status = QStringLiteral("Ready");
             runIds.prepend(active);
+            requeued = true;
         } else if (!cancelled)
             ++failedCount;
     }
     emit message(error);
-    recordAttempt(cancelled ? QStringLiteral("Cancelled") : QStringLiteral("Failed"), error);
+    if (!requeued)
+        recordAttempt(cancelled ? QStringLiteral("Cancelled") : QStringLiteral("Failed"), error);
     active.clear();
     persist();
-    retryTimer.start(retry ? 3000 : 0);
+    retryTimer.start(retry && sessionResults.isEmpty() ? 3000 : 0);
 }
 void Engine::cancel() {
     if (!busy)
         return;
     cancelled = true;
-    if (retryTimer.isActive()) {
+    if (retryTimer.isActive() && sessionResults.isEmpty()) {
         retryTimer.stop();
         finishRun();
         return;
@@ -829,15 +1009,18 @@ void Engine::finishRun() {
     busy = false;
     active.clear();
     runIds.clear();
+    sessionIds.clear();
+    sessionResults.clear();
     timeout.stop();
     emit transferStatus({});
     password.clear();
     persist();
-    emit busyChanged(false);
     emit activity(QStringLiteral("%1 · %2 completed, %3 failed")
                       .arg(cancelled   ? QStringLiteral("Stopped")
                            : stopAfter ? QStringLiteral("Stopped after current item")
                                        : QStringLiteral("Finished"))
                       .arg(succeededCount)
                       .arg(failedCount));
+    stopAfter = false;
+    emit busyChanged(false);
 }

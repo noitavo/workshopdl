@@ -1,4 +1,5 @@
 #include "window.h"
+#include "modspage.h"
 #include "ui_settingsdialog.h"
 #include <QStyleFactory>
 
@@ -47,6 +48,7 @@ void Window::settingsDialog() {
     auto *dependencies = form.dependencies;
     auto *after = form.after;
     auto *autoInstall = form.autoInstall;
+    auto *removeCopy = form.removeCopy;
     auto *authentication = form.authentication;
     auto *steam = form.steam;
     auto *steamBrowse = form.steamBrowse;
@@ -70,13 +72,14 @@ void Window::settingsDialog() {
     loadCheck(dependencies, QStringLiteral("checkDependencies"), false);
     loadCheck(after, QStringLiteral("openAfter"), false);
     loadCheck(autoInstall, QStringLiteral("autoInstall"), false);
-    loadCheck(updates, QStringLiteral("automaticUpdates"), false);
-    startup->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("startupTab"), 0).toInt(), 3));
+    loadCheck(removeCopy, QStringLiteral("removeSteamCopy"), false);
+    loadCheck(updates, QStringLiteral("checkUpdatesAtStartup"), true);
+    startup->setCurrentIndex(qBound(0, engine.settings.value(QStringLiteral("startupTab"), 0).toInt(), 2));
     startup->setEnabled(!remember->isChecked());
     connect(remember, &QCheckBox::toggled, startup, [startup](bool on) { startup->setEnabled(!on); });
     directory->setText(engine.root);
     steam->setText(engine.steamExe);
-    apiKey->setText(engine.settings.value(QStringLiteral("apiKey")).toString());
+    apiKey->setText(engine.apiKey());
     const QStringList methods{QStringLiteral("auto"), QStringLiteral("steamcmd"), QStringLiteral("http")};
     for (int index = 0; index < methods.size(); ++index)
         method->setItemData(index, methods[index]);
@@ -143,6 +146,12 @@ void Window::settingsDialog() {
                                  QStringLiteral("Choose an absolute path ending in steamcmd.exe."));
             return;
         }
+        if (!engine.setApiKey(apiKey->text().trimmed())) {
+            QMessageBox::warning(&dialog, QStringLiteral("Steam Web API key"),
+                                 QStringLiteral("Windows Credential Manager could not save this key."));
+            return;
+        }
+        const QString previousRoot = engine.root;
         engine.root = path;
         engine.setSteamcmdPath(executable);
         auto &s = engine.settings;
@@ -180,11 +189,24 @@ void Window::settingsDialog() {
         s.setValue(QStringLiteral("method"), method->currentData());
         s.setValue(QStringLiteral("openAfter"), after->isChecked());
         s.setValue(QStringLiteral("autoInstall"), autoInstall->isChecked());
-        s.setValue(QStringLiteral("automaticUpdates"), updates->isChecked());
-        s.setValue(QStringLiteral("apiKey"), apiKey->text().trimmed());
+        s.setValue(QStringLiteral("removeSteamCopy"), removeCopy->isChecked());
+        s.setValue(QStringLiteral("checkUpdatesAtStartup"), updates->isChecked());
+        s.remove(QStringLiteral("automaticUpdates"));
+        s.remove(QStringLiteral("lastUpdateCheck"));
         s.remove(QStringLiteral("releaseRepository"));
         refresh();
         dialog.accept();
+        if (QDir::cleanPath(previousRoot).compare(path, Qt::CaseInsensitive) != 0 && !pathsOverlap(previousRoot, path) &&
+            std::any_of(library.items.cbegin(), library.items.cend(),
+                        [&previousRoot](const Item &item) {
+                            return QDir::cleanPath(item.path).startsWith(QDir::cleanPath(previousRoot) + QLatin1Char('/'),
+                                                                         Qt::CaseInsensitive);
+                        }) &&
+            QMessageBox::question(this, QStringLiteral("Move downloads"),
+                                  QStringLiteral("Move your existing downloads to the new folder?")) ==
+                QMessageBox::Yes)
+            moveDownloads(previousRoot, path);
+        modsPage->reload();
     });
     dialog.exec();
 }
@@ -192,7 +214,7 @@ void Window::checkUpdates(bool quiet) {
     const QString repo = QStringLiteral("noitavo/workshopdl");
     QNetworkRequest request{
         QUrl(QStringLiteral("https://api.github.com/repos/") + repo + QStringLiteral("/releases/latest"))};
-    request.setRawHeader("User-Agent", "WorkshopDL++/1.0");
+    request.setRawHeader("User-Agent", "WorkshopDL++/" APP_VERSION);
     request.setTransferTimeout(20000);
     auto *reply = engine.network.get(request);
     connect(reply, &QNetworkReply::downloadProgress, reply, [reply](qint64 bytes, qint64) {
@@ -206,7 +228,6 @@ void Window::checkUpdates(bool quiet) {
                 QMessageBox::warning(this, QStringLiteral("Update check failed"), reply->errorString());
             return;
         }
-        engine.settings.setValue(QStringLiteral("lastUpdateCheck"), QDateTime::currentSecsSinceEpoch());
         const auto object = QJsonDocument::fromJson(reply->readAll()).object();
         const auto tag = object.value(QStringLiteral("tag_name")).toString();
         const auto version = QVersionNumber::fromString(tag.startsWith(QLatin1Char('v')) ? tag.mid(1) : tag);
@@ -224,11 +245,19 @@ void Window::checkUpdates(bool quiet) {
                                          QStringLiteral("You have the current version."));
             return;
         }
-        if (QMessageBox::question(
-                this, QStringLiteral("Update available"),
-                QStringLiteral(
-                    "WorkshopDL++ %1 is available. Open the release page to review and download it?")
-                    .arg(tag)) == QMessageBox::Yes)
+        if (quiet && engine.settings.value(QStringLiteral("skippedVersion")).toString() == tag)
+            return;
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Information);
+        box.setWindowTitle(QStringLiteral("Update available"));
+        box.setText(QStringLiteral("WorkshopDL++ %1 is available. Open the release page to review and download it?").arg(tag));
+        auto *open = box.addButton(QStringLiteral("Open release page"), QMessageBox::AcceptRole);
+        auto *skip = box.addButton(QStringLiteral("Skip this version"), QMessageBox::DestructiveRole);
+        box.addButton(QStringLiteral("Later"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == open)
             QDesktopServices::openUrl(page);
+        else if (box.clickedButton() == skip)
+            engine.settings.setValue(QStringLiteral("skippedVersion"), tag);
     });
 }

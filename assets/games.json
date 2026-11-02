@@ -1,0 +1,25 @@
+{
+  "games": [
+    {"id": "4000", "name": "Garry's Mod", "modFolder": "garrysmod/addons", "format": "gma", "note": "GMA archives are extracted into addon folders."},
+    {"id": "294100", "name": "RimWorld", "modFolder": "Mods", "format": "rimworld", "activation": "rimworld", "note": "Folder mods with About/About.xml. Enable them here or in the game's Mods menu."},
+    {"id": "440", "name": "Team Fortress 2", "modFolder": "tf/custom", "format": "folder", "note": "Custom content folders. Some Workshop items cannot be installed."},
+    {"id": "550", "name": "Left 4 Dead 2", "modFolder": "left4dead2/addons", "format": "files:.vpk", "note": "VPK addon packages."},
+    {"id": "620", "name": "Portal 2", "modFolder": "portal2/maps/workshop", "format": "portal", "note": "BSP maps are kept in their Workshop item folder."},
+    {"id": "108600", "name": "Project Zomboid", "modFolder": "@home/Zomboid/mods", "format": "zomboid", "note": "Requires mod.info. Enable mods in the game."},
+    {"id": "107410", "name": "Arma 3", "modFolder": "Mods", "format": "folder", "note": "Add the installed folder to the Arma 3 launcher's watched folders."},
+    {"id": "346110", "name": "ARK: Survival Evolved", "modFolder": "ShooterGame/Content/Mods", "format": "ark", "note": "Requires a cooked item folder and matching .mod file. Convert raw packages with ARK's tools."},
+    {"id": "211820", "name": "Starbound", "modFolder": "mods", "format": "files:.pak", "note": "PAK mod packages."},
+    {"id": "219740", "name": "Don't Starve", "modFolder": "mods", "format": "folder", "note": "Local mod folders. Enable in game."},
+    {"id": "322330", "name": "Don't Starve Together", "modFolder": "mods", "format": "folder", "note": "Local client mods. Dedicated server configuration is separate."},
+    {"id": "268500", "name": "XCOM 2", "modFolder": "XComGame/Mods", "format": "folder", "note": "Local mod folders. For War of the Chosen choose its XComGame/Mods destination."},
+    {"id": "304930", "name": "Unturned", "modFolder": "", "format": "manual", "note": "Client content is Steam-managed. Dedicated servers use WorkshopDownloadConfig.json."},
+    {"id": "427520", "name": "Factorio", "modFolder": "@roaming/Factorio/mods", "format": "files:.zip", "activation": "factorio", "note": "Local ZIP packages only. Factorio does not use Steam Workshop."},
+    {"id": "1281930", "name": "tModLoader", "modFolder": "@documents/My Games/Terraria/tModLoader/Mods", "format": "files:.tmod", "activation": "tmodloader", "note": "TMOD packages. Reload mods inside tModLoader after changes."},
+    {"id": "227300", "name": "Euro Truck Simulator 2", "modFolder": "@documents/Euro Truck Simulator 2/mod", "format": "files:.scs,.zip", "note": "Local SCS/ZIP packages; activate them in the game's Mod Manager."},
+    {"id": "270880", "name": "American Truck Simulator", "modFolder": "@documents/American Truck Simulator/mod", "format": "files:.scs,.zip", "note": "Local SCS/ZIP packages; activate them in the game's Mod Manager."},
+    {"id": "255710", "name": "Cities: Skylines", "modFolder": "@local/Colossal Order/Cities_Skylines", "format": "manual", "note": "Install manually with the game's content tools; folders vary by content type."},
+    {"id": "244850", "name": "Space Engineers", "modFolder": "@roaming/SpaceEngineers/Mods", "format": "folder", "note": "Local mod folders. Add them to the world from the game's mod menu."},
+    {"id": "286160", "name": "Tabletop Simulator", "modFolder": "@documents/My Games/Tabletop Simulator", "format": "tabletop", "note": "JSON saves. The game downloads referenced assets."},
+    {"id": "431960", "name": "Wallpaper Engine", "modFolder": "projects/backup", "format": "folder", "note": "Offline project backups. Import the backup through Wallpaper Engine."}
+  ]
+}

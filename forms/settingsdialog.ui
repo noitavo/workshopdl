@@ -110,28 +110,7 @@
                  </widget>
                 </item>
                 <item row="0" column="1">
-                 <widget class="QComboBox" name="startup">
-                  <item>
-                   <property name="text">
-                    <string>Browser</string>
-                   </property>
-                  </item>
-                  <item>
-                   <property name="text">
-                    <string>Manual</string>
-                   </property>
-                  </item>
-                  <item>
-                   <property name="text">
-                    <string>Library</string>
-                   </property>
-                  </item>
-                  <item>
-                   <property name="text">
-                    <string>Mod Manager (Experimental)</string>
-                   </property>
-                  </item>
-                 </widget>
+                 <widget class="QComboBox" name="startup"><item><property name="text"><string>Browse</string></property></item><item><property name="text"><string>Downloads</string></property></item><item><property name="text"><string>Mods</string></property></item></widget>
                 </item>
                </layout>
               </item>
@@ -372,12 +351,22 @@
             </widget>
            </item>
            <item>
+            <widget class="QCheckBox" name="removeCopy">
+             <property name="toolTip">
+              <string>Saves disk space. SteamCMD downloads the whole item again next time.</string>
+             </property>
+             <property name="text">
+              <string>Remove SteamCMD's copy after saving</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QCheckBox" name="checkMods">
              <property name="toolTip">
               <string>Checks Workshop items. Download updates manually.</string>
              </property>
              <property name="text">
-              <string>Check mod updates at startup</string>
+              <string>Check mod updates at startup and every 6 hours</string>
              </property>
              <property name="checked">
               <bool>false</bool>
@@ -560,7 +549,7 @@
              <item row="1" column="1">
               <widget class="QLineEdit" name="apiKey">
                <property name="toolTip">
-                <string>Used for Steam metadata and required items. Saved as plain text in settings.ini.</string>
+                <string>Used for Steam metadata and required items. Saved in Windows Credential Manager.</string>
                </property>
                <property name="echoMode">
                 <enum>QLineEdit::EchoMode::Password</enum>
@@ -578,7 +567,7 @@
            <item>
             <widget class="QCheckBox" name="updates">
              <property name="text">
-              <string>Check weekly for application updates</string>
+              <string>Check for application updates at startup</string>
              </property>
              <property name="checked">
               <bool>false</bool>

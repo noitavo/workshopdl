@@ -27,10 +27,18 @@ void showAboutDialog(QWidget *parent) {
 
 }
 
+void Window::showGettingStarted() {
+    QDialog dialog(this);
+    Ui::GettingStartedDialog form;
+    form.setupUi(&dialog);
+    connect(form.buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    dialog.exec();
+}
+
 void Window::createMenus() {
     auto *folderMenuBar = new QMenuBar(menuBar());
     folderMenuBar->setNativeMenuBar(false);
-    auto *downloadsFolder = folderMenuBar->addAction(QStringLiteral("Downloads &folder"));
+    auto *downloadsFolder = folderMenuBar->addAction(QStringLiteral("Downloads folder"));
     downloadsFolder->setObjectName(QStringLiteral("downloadsFolder"));
     menuBar()->setCornerWidget(folderMenuBar, Qt::TopRightCorner);
     const auto openDownloads = [this] {
@@ -74,7 +82,10 @@ void Window::createMenus() {
     });
     setupDownloadMethods();
     connect(accountAction, &QAction::triggered, this, &Window::accountDialog);
-    connect(ui->actionHistory, &QAction::triggered, this, &Window::showHistory);
+    connect(ui->actionHistory, &QAction::triggered, this, [this] {
+        tabs->setCurrentIndex(1);
+        ui->downloadTabs->setCurrentIndex(1);
+    });
     connect(recover, &QAction::triggered, this, &Window::recoverLibrary);
     connect(clean, &QAction::triggered, this, &Window::cleanCache);
     connect(ui->actionGameTools, &QAction::triggered, this, &Window::gameTools);
@@ -103,8 +114,7 @@ void Window::createMenus() {
             [this, bookmarksMenu] { fillBookmarks(bookmarksMenu); });
     auto *viewMenu = ui->viewMenu;
     auto *views = new QActionGroup(viewMenu);
-    const QList<QAction *> viewActions{ui->actionBrowser, ui->actionManual, ui->actionLibrary,
-                                       ui->actionModManager};
+    const QList<QAction *> viewActions{ui->actionBrowser, ui->actionManual, ui->actionLibrary};
     for (int index = 0; index < viewActions.size(); ++index) {
         auto *action = viewActions[index];
         action->setData(index);
@@ -117,13 +127,7 @@ void Window::createMenus() {
     });
     connect(ui->actionActivityLog, &QAction::triggered, this, &Window::showLog);
     connect(ui->actionSettings, &QAction::triggered, this, &Window::settingsDialog);
-    connect(ui->actionGettingStarted, &QAction::triggered, this, [this] {
-        QDialog dialog(this);
-        Ui::GettingStartedDialog form;
-        form.setupUi(&dialog);
-        connect(form.buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-        dialog.exec();
-    });
+    connect(ui->actionGettingStarted, &QAction::triggered, this, &Window::showGettingStarted);
     connect(ui->actionGameSupport, &QAction::triggered, this, &Window::showSupport);
     connect(ui->actionSteamcmdDocs, &QAction::triggered, this, [] {
         QDesktopServices::openUrl(QUrl(QStringLiteral("https://developer.valvesoftware.com/wiki/SteamCMD")));

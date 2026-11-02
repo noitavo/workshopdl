@@ -6,6 +6,7 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw 'Run build.bat before packaging.'
 }
 if (-not (Test-Path -LiteralPath (Join-Path $bin 'Qt6Core.dll') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $bin 'vcruntime140.dll') -PathType Leaf) -or
     -not (Test-Path -LiteralPath (Join-Path $bin 'platforms\qwindows.dll') -PathType Leaf)) {
     throw 'Qt deployment is incomplete. Run build.bat again.'
 }
@@ -36,8 +37,10 @@ Copy-Item -LiteralPath (Join-Path $root 'third_party\webview2\LICENSE.txt') -Des
 Copy-Item -LiteralPath (Join-Path $root 'third_party\webview2\NOTICE.txt') -Destination (Join-Path $package 'licenses\WebView2\NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'assets\about\license.txt') -Destination (Join-Path $package 'licenses\WorkshopDL.txt')
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $package 'licenses\CC-BY-NC-SA-4.0.txt')
+Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $package 'README.md')
 
 Compress-Archive -LiteralPath $package -DestinationPath $archive -Force
+Compress-Archive -LiteralPath (Join-Path $bin 'WorkshopDL.pdb') -DestinationPath (Join-Path $dist "$name-symbols.zip") -Force
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText("$archive.sha256", "$hash  $name.zip`r`n", [Text.Encoding]::ASCII)
 Write-Output "Package: $archive"

@@ -13,6 +13,11 @@ bool safeTree(const QString &path, QString *error = nullptr, bool allowEmpty = f
 bool copyTree(const QString &source, const QString &target, QString *error);
 bool linkedAncestor(QString path);
 bool pathsOverlap(const QString &first, const QString &second);
+bool renamePath(const QString &from, const QString &to);
+void removeSteamCopy(const QString &contentPath);
+qint64 directoryBytes(const QString &path);
 QString savedPassword(const QString &username);
 bool storePassword(const QString &username, const QString &password);
 void forgetPassword();
+QString savedApiKey();
+bool storeApiKey(const QString &key);

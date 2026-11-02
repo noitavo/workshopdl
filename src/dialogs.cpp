@@ -25,6 +25,17 @@ void Window::accountDialog() {
     };
     connect(mode, &QComboBox::currentIndexChanged, &dialog, toggle);
     toggle();
+    auto *signOut = buttons->addButton(QStringLiteral("Sign out"), QDialogButtonBox::ResetRole);
+    signOut->setEnabled(!engine.username.isEmpty());
+    connect(signOut, &QPushButton::clicked, &dialog, [&] {
+        if (QMessageBox::question(&dialog, QStringLiteral("Sign out"),
+                                  QStringLiteral("Forget this account and SteamCMD's saved sign-in?")) !=
+            QMessageBox::Yes)
+            return;
+        engine.signOut();
+        dialog.reject();
+        refresh();
+    });
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
         const QString name = user->text().trimmed();
@@ -54,15 +65,33 @@ void Window::accountDialog() {
     dialog.exec();
 }
 void Window::guardDialog(const QString &prompt) {
-    bool ok = false;
-    const QString value =
-        QInputDialog::getText(this, QStringLiteral("SteamCMD sign-in"), prompt, QLineEdit::Password, {}, &ok);
-    if (ok && !value.isEmpty())
+    if (!engine.authPending())
+        return;
+    const bool password = prompt == QStringLiteral("Steam password");
+    QInputDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("SteamCMD sign-in"));
+    dialog.setLabelText(prompt);
+    dialog.setTextEchoMode(password ? QLineEdit::Password : QLineEdit::Normal);
+    bool expired = false;
+    connect(&engine, &Engine::authExpired, &dialog, [&] {
+        expired = true;
+        dialog.reject();
+    });
+    const bool accepted = dialog.exec() == QDialog::Accepted;
+    if (expired)
+        return;
+    const QString value = password ? dialog.textValue() : dialog.textValue().trimmed();
+    if (accepted && !value.isEmpty())
         engine.submitInput(value);
     else
         engine.cancel();
 }
 void Window::collectionDialog(const QString &id, const QString &title, const QStringList &children) {
+    if (collectionOpen) {
+        pendingCollections.append({id, title, children});
+        return;
+    }
+    collectionOpen = true;
     QDialog dialog(this);
     Ui::CollectionDialog form;
     form.setupUi(&dialog);
@@ -77,7 +106,7 @@ void Window::collectionDialog(const QString &id, const QString &title, const QSt
         auto *row = new QListWidgetItem(child, list);
         row->setData(Qt::UserRole, child);
         row->setFlags(row->flags() | Qt::ItemIsUserCheckable);
-        row->setCheckState(queue.get(child) ? Qt::Unchecked : Qt::Checked);
+        row->setCheckState(queue.get(child) || library.get(child) ? Qt::Unchecked : Qt::Checked);
     }
     connect(all, &QPushButton::clicked, &dialog, [list] {
         for (int n = 0; n < list->count(); ++n)
@@ -90,7 +119,7 @@ void Window::collectionDialog(const QString &id, const QString &title, const QSt
     });
     engine.preview(
         children, &dialog,
-        [list, previewStatus, children](QHash<QString, QJsonObject> details, QString error) {
+        [this, list, previewStatus, children](QHash<QString, QJsonObject> details, QString error) {
             for (int n = 0; n < list->count(); ++n) {
                 auto *row = list->item(n);
                 const QString itemId = row->data(Qt::UserRole).toString();
@@ -99,7 +128,10 @@ void Window::collectionDialog(const QString &id, const QString &title, const QSt
                 if (!title.isEmpty()) {
                     const auto app = metadata.value(QStringLiteral("consumer_app_id"));
                     const auto appId = app.isString() ? app.toString() : QString::number(app.toInteger());
-                    row->setText(title + QStringLiteral(" · ") + gameName(appId));
+                    row->setText(title + QStringLiteral(" · ") + gameName(appId) +
+                                 (queue.get(itemId)     ? QStringLiteral(" · in queue")
+                                  : library.get(itemId) ? QStringLiteral(" · downloaded")
+                                                        : QString()));
                     row->setToolTip(QStringLiteral("Item ") + itemId);
                 } else if (error.isEmpty()) {
                     row->setText(itemId + QStringLiteral(" · unavailable"));
@@ -109,7 +141,7 @@ void Window::collectionDialog(const QString &id, const QString &title, const QSt
             }
             previewStatus->setText(
                 error.isEmpty()
-                    ? QStringLiteral("%1 entries. Existing queue items will be skipped.").arg(children.size())
+                    ? QStringLiteral("%1 entries. Queued and downloaded items start unchecked.").arg(children.size())
                     : QStringLiteral("Titles unavailable. Select items by ID."));
         });
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Add selected"));
@@ -144,6 +176,12 @@ void Window::collectionDialog(const QString &id, const QString &title, const QSt
         downloadWhenReady.removeAll(id);
     }
     engine.persist();
+    collectionOpen = false;
+    if (!pendingCollections.isEmpty()) {
+        const auto pending = pendingCollections.takeFirst();
+        QTimer::singleShot(0, this,
+                           [this, pending] { collectionDialog(pending.id, pending.title, pending.children); });
+    }
 }
 void Window::queueMenu(const QPoint &pos, QTableView *view) {
     const auto index = view->indexAt(pos);
@@ -202,116 +240,24 @@ void Window::queueMenu(const QPoint &pos, QTableView *view) {
         engine.persist();
     });
     app->setEnabled(!engine.busy && engine.resolving == 0);
-    auto *remove = menu.addAction(QStringLiteral("Remove from queue"), this, [this, ids] {
-        queue.removeIds(ids);
-        engine.persist();
-    });
-    remove->setEnabled(!engine.busy && !diskBusy && !engine.resolving);
+    auto *remove = menu.addAction(QStringLiteral("Remove from queue"), this, [this, view] { removeQueue(view); });
+    remove->setEnabled(!diskBusy && !engine.resolving);
     menu.exec(view->viewport()->mapToGlobal(pos));
-}
-void Window::libraryMenu(const QPoint &pos) {
-    const auto ids = selected(libraryView, &library);
-    if (ids.isEmpty())
-        return;
-    QMenu menu(this);
-    menu.addAction(QStringLiteral("Open folder"), this, [this] { openSelected(false); });
-    menu.addAction(QStringLiteral("Open Workshop page"), this, [this] { openSelected(true); });
-    auto *copy = menu.addAction(QStringLiteral("Copy link"), this,
-                                [ids] { QApplication::clipboard()->setText(workshopUrl(ids.first())); });
-    copy->setEnabled(!library.get(ids.first())->local);
-    auto *install = menu.addAction(QStringLiteral("Install…"), this, &Window::installSelected);
-    install->setEnabled(!diskBusy && !engine.busy &&
-                        profileFor(library.get(ids.first())->appId).format != QStringLiteral("manual"));
-    auto *redownload = menu.addAction(QStringLiteral("Queue again"), this, [this, ids] {
-        if (!engine.busy) {
-            auto remote = ids;
-            remote.removeIf([this](const QString &id) { return library.get(id)->local; });
-            engine.resolve(remote);
-            tabs->setCurrentIndex(1);
-        }
-    });
-    redownload->setEnabled(!library.get(ids.first())->local);
-    menu.addSeparator();
-    menu.addAction(QStringLiteral("Delete files…"), this, &Window::deleteSelected);
-    menu.exec(libraryView->viewport()->mapToGlobal(pos));
-}
-void Window::openSelected(bool website) {
-    const auto ids = selected(libraryView, &library);
-    if (ids.isEmpty())
-        return;
-    const auto *item = library.get(ids.first());
-    if (!item)
-        return;
-    if (website && item->local)
-        activity->setText(QStringLiteral("Local imports have no Workshop page."));
-    else if (website)
-        navigate(QUrl(workshopUrl(item->id)));
-    else
-        openFolder(item->path);
-}
-void Window::installSelected() {
-    installItems(selected(libraryView, &library));
-}
-void Window::deleteSelected() {
-    if (engine.busy || diskBusy)
-        return;
-    const auto ids = selected(libraryView, &library);
-    if (ids.isEmpty())
-        return;
-    if (QMessageBox::warning(
-            this, QStringLiteral("Delete downloaded files"),
-            QStringLiteral("Delete downloaded files for %1 items permanently? Installed mods will be kept.")
-                .arg(ids.size()),
-            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
-        return;
-    QList<Item> items;
-    for (const auto &id : ids)
-        if (const auto *i = library.get(id))
-            items.append(*i);
-    diskBusy = true;
-    refresh();
-    auto *watcher = new QFutureWatcher<QStringList>(this);
-    connect(watcher, &QFutureWatcher<QStringList>::finished, this, [this, watcher, ids] {
-        const auto failures = watcher->result();
-        watcher->deleteLater();
-        QStringList removed;
-        for (const auto &id : ids)
-            if (!failures.contains(id))
-                removed.append(id);
-        library.removeIds(removed);
-        queue.removeIds(removed);
-        diskBusy = false;
-        engine.persist();
-        refresh();
-        if (!failures.isEmpty())
-            QMessageBox::warning(this, QStringLiteral("Some files were kept"),
-                                 QStringLiteral("Could not safely delete item(s): %1")
-                                     .arg(failures.join(QStringLiteral(", "))));
-    });
-    watcher->setFuture(QtConcurrent::run([items] {
-        QStringList failures;
-        for (const auto &i : items) {
-            const QFileInfo info(i.path);
-            const bool managedName = info.fileName() == i.id ||
-                                     info.fileName() == i.id + QStringLiteral(".partial") ||
-                                     info.fileName() == i.id + QStringLiteral(".previous");
-            if (!validId(i.id) || !validId(i.appId) || !managedName ||
-                QFileInfo(info.absolutePath()).fileName() != i.appId || linkedAncestor(i.path)) {
-                failures.append(i.id);
-                continue;
-            }
-            if (info.exists() && (!safeTree(i.path, nullptr, true) || !QDir(i.path).removeRecursively()))
-                failures.append(i.id);
-        }
-        return failures;
-    }));
 }
 void Window::closeEvent(QCloseEvent *event) {
     if (engine.busy || diskBusy) {
-        QMessageBox::information(
-            this, QStringLiteral("Operation in progress"),
-            QStringLiteral("Stop downloads or wait for the file operation before closing."));
         event->ignore();
+        if (closeRequested)
+            return;
+        if (QMessageBox::question(this, QStringLiteral("Operation in progress"),
+                                  QStringLiteral("Stop the current download and close WorkshopDL++? File "
+                                                 "operations finish first.")) != QMessageBox::Yes)
+            return;
+        closeRequested = true;
+        downloadWhenReady.clear();
+        activity->setText(QStringLiteral("Closing after the current operation stops…"));
+        if (engine.busy)
+            engine.cancel();
         return;
     }
     saveTabLayout();

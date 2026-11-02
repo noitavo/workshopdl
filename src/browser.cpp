@@ -86,7 +86,7 @@ void Window::setupBrowser() {
     queueMenuButton->setMenu(queueMenu);
     queueMenu->addAction(QStringLiteral("Add links…"), this, &Window::pasteMultiple);
     queueMenu->addAction(QStringLiteral("Import collection…"), this, &Window::collectionImport);
-    queueMenu->addAction(QStringLiteral("Clear completed"), this, &Window::clearCompleted);
+    queueMenu->addAction(QStringLiteral("Show history"), this, [this] { ui->browserDownloads->setCurrentIndex(1); });
     queueMenu->addAction(QStringLiteral("Open full queue"), this, [this] { tabs->setCurrentIndex(1); });
     configureTable(browserQueue, &queue);
     browserQueue->hideColumn(1);
@@ -131,7 +131,6 @@ void Window::setupBrowser() {
         key->setContext(Qt::WidgetWithChildrenShortcut);
         connect(key, &QShortcut::activated, this, [moveSelection, direction] { moveSelection(direction); });
     }
-    connect(ui->clearCompletedButton, &QPushButton::clicked, this, [this] { clearCompleted(); });
     connect(ui->queueDetailsButton, &QPushButton::clicked, this, [this] {
         const auto ids = this->selected(browserQueue, &queue);
         tabs->setCurrentIndex(1);
@@ -185,19 +184,16 @@ void Window::setupBrowser() {
         syncBrowser();
     });
     connect(web, &BrowserView::loadingChanged, this, [this](const BrowserLoadInfo &info) {
-        syncBrowser();
         if (info.status() == BrowserLoadInfo::LoadStatus::Started)
             browserLoadTimer.start(45000);
-        else {
+        else
             browserLoadTimer.stop();
-        }
+        browserError.clear();
         if (info.status() == BrowserLoadInfo::LoadStatus::Failed) {
-            pageStatus->setText(QStringLiteral("Page could not load. Use Reload to try again."));
+            browserError = QStringLiteral("Page could not load. Use Reload to try again.");
             appendLog(QStringLiteral("Browser: ") + info.errorString());
-        } else if (info.status() == BrowserLoadInfo::LoadStatus::Succeeded) {
-            appendLog(QStringLiteral("Browser loaded: ") +
-                      info.url().toString(QUrl::RemoveQuery | QUrl::RemoveFragment));
         }
+        syncBrowser();
     });
     browserLoadTimer.setSingleShot(true);
     browserMetadataTimer.setSingleShot(true);
@@ -263,9 +259,13 @@ void Window::syncBrowser() {
     browserAdd->setText(queued       ? QStringLiteral("In queue")
                         : collection ? QStringLiteral("Review collection…")
                                      : QStringLiteral("Add to queue"));
-    browserDownload->setText(collection ? QStringLiteral("Download collection…")
-                                        : QStringLiteral("Download now"));
-    browserDownload->setEnabled(valid && !engine.busy && !diskBusy);
+    const auto *pageItem = valid ? queue.get(ids.first()) : nullptr;
+    const bool transferring = pageItem && (pageItem->status == QStringLiteral("Downloading") ||
+                                           pageItem->status == QStringLiteral("Verifying"));
+    browserDownload->setText(collection    ? QStringLiteral("Download collection…")
+                             : engine.busy ? QStringLiteral("Download next")
+                                           : QStringLiteral("Download now"));
+    browserDownload->setEnabled(valid && !transferring && !diskBusy);
     if (valid) {
         const auto *item = queue.get(ids.first());
         if (collection) {
@@ -273,18 +273,23 @@ void Window::syncBrowser() {
                 pageTitle->setText(browserPreviewTitle);
             pageStatus->setText(QStringLiteral("Collection · choose items to download."));
         } else
-            pageStatus->setText(item ? QStringLiteral("Item %1 · %2").arg(ids.first(), item->status)
-                                     : QStringLiteral("Item %1").arg(ids.first()));
+            pageStatus->setText(item                     ? QStringLiteral("Item %1 · %2").arg(ids.first(), item->status)
+                                : library.get(ids.first()) ? QStringLiteral("Item %1 · Downloaded").arg(ids.first())
+                                                           : QStringLiteral("Item %1").arg(ids.first()));
     } else
         pageStatus->setText(web->isLoading() ? QStringLiteral("Loading page…")
                                              : QStringLiteral("Open an item or collection to download it."));
+    if (!browserError.isEmpty())
+        pageStatus->setText(browserError);
 }
 void Window::downloadPage(bool now) {
     const auto ids = parseIds(web->url().toString());
     if (ids.size() != 1)
         return;
-    if (now)
-        downloadWhenReady = ids;
+    if (now) {
+        downloadWhenReady.append(ids);
+        downloadWhenReady.removeDuplicates();
+    }
     addText(web->url().toString());
     maybeStartDownloads();
 }

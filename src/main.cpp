@@ -1,12 +1,75 @@
 #include "window.h"
 #include "steamsetupdialog.h"
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QStyleFactory>
+#include <cwchar>
+#include <qt_windows.h>
+#include <dbghelp.h>
 
 static_assert(sizeof(void *) == 8, "WorkshopDL++ requires an x64 build.");
+
+namespace {
+wchar_t crashFolder[MAX_PATH * 4];
+
+LONG WINAPI writeCrashDump(EXCEPTION_POINTERS *exception) {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t path[MAX_PATH * 4 + 64];
+    swprintf(path, sizeof(path) / sizeof(path[0]), L"%ls\\crash-%04d%02d%02d-%02d%02d%02d.dmp", crashFolder,
+             time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+    const HANDLE file =
+        CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION details{GetCurrentThreadId(), exception, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &details, nullptr,
+                          nullptr);
+        CloseHandle(file);
+    }
+    MessageBoxW(nullptr,
+                L"WorkshopDL++ stopped unexpectedly. A crash report was saved in the data\\crashes folder.",
+                L"WorkshopDL++", MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void installCrashHandler() {
+    const QString folder = dataRoot() + QStringLiteral("/crashes");
+    if (!QDir().mkpath(folder))
+        return;
+    const QString native = QDir::toNativeSeparators(folder);
+    if (native.size() >= int(sizeof(crashFolder) / sizeof(crashFolder[0])))
+        return;
+    crashFolder[native.toWCharArray(crashFolder)] = L'\0';
+    SetUnhandledExceptionFilter(writeCrashDump);
+}
+
+bool activateRunningInstance() {
+    HWND target = nullptr;
+    EnumWindows(
+        [](HWND candidate, LPARAM result) -> BOOL {
+            wchar_t title[32]{}, type[64]{};
+            GetWindowTextW(candidate, title, 32);
+            GetClassNameW(candidate, type, 64);
+            if (std::wcscmp(title, L"WorkshopDL++") != 0 || std::wcsncmp(type, L"Qt", 2) != 0 ||
+                !std::wcsstr(type, L"QWindow"))
+                return TRUE;
+            *reinterpret_cast<HWND *>(result) = candidate;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&target));
+    if (!target)
+        return false;
+    if (IsIconic(target))
+        ShowWindow(target, SW_RESTORE);
+    SetForegroundWindow(target);
+    return true;
+}
+}
 
 int main(int argc, char **argv) {
 
     QApplication app(argc, argv);
+    installCrashHandler();
     const QColor windowsAccent = app.palette().color(QPalette::Accent);
     QSettings appearance(dataRoot() + QStringLiteral("/settings.ini"), QSettings::IniFormat);
     const QString style =
@@ -54,7 +117,7 @@ int main(int argc, char **argv) {
         app.setPalette(palette);
     app.setOrganizationName(QStringLiteral("WorkshopDL"));
     app.setApplicationName(QStringLiteral("WorkshopDL++"));
-    app.setApplicationVersion(QStringLiteral("1.0.0"));
+    app.setApplicationVersion(QStringLiteral(APP_VERSION));
     app.setWindowIcon(QIcon(QStringLiteral(":/branding/workshopdl.png")));
     QTemporaryFile storageProbe(dataRoot() + QStringLiteral("/.write-check-XXXXXX"));
     if (!storageProbe.open()) {
@@ -66,27 +129,60 @@ int main(int argc, char **argv) {
     storageProbe.close();
     storageProbe.remove();
     QLockFile lock(dataRoot() + QStringLiteral("/app.lock"));
+    QString links;
+    for (const auto &argument : app.arguments().mid(1))
+        links += argument + QLatin1Char('\n');
+    const QString serverName =
+        QStringLiteral("WorkshopDL++-") +
+        QString::fromLatin1(QCryptographicHash::hash(dataRoot().toUtf8(), QCryptographicHash::Sha256).toHex());
     if (!lock.tryLock(100)) {
-        QMessageBox::information(nullptr, QStringLiteral("WorkshopDL++"),
-                                 QStringLiteral("WorkshopDL++ is already running."));
+        if (!links.isEmpty()) {
+            QLocalSocket socket;
+            socket.connectToServer(serverName);
+            if (socket.waitForConnected(1000)) {
+                socket.write(links.toUtf8());
+                socket.waitForBytesWritten(1000);
+                socket.disconnectFromServer();
+            }
+        }
+        if (!activateRunningInstance())
+            QMessageBox::information(nullptr, QStringLiteral("WorkshopDL++"),
+                                     QStringLiteral("WorkshopDL++ is already running."));
         return 0;
     }
     ItemModel queue(nullptr, 10000), library;
     Engine engine(&queue, &library);
     std::unique_ptr<Window> window;
     std::unique_ptr<SteamSetupDialog> setup;
+    QLocalServer linkServer;
+    linkServer.setSocketOptions(QLocalServer::UserAccessOption);
+    QLocalServer::removeServer(serverName);
+    linkServer.listen(serverName);
+    QObject::connect(&linkServer, &QLocalServer::newConnection, &app, [&] {
+        auto *socket = linkServer.nextPendingConnection();
+        QObject::connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
+        QObject::connect(socket, &QLocalSocket::readyRead, socket, [socket, &window, &links] {
+            const QString text = QString::fromUtf8(socket->read(4 * 1024 * 1024));
+            if (window)
+                window->queueLinks(text);
+            else
+                links += text;
+        });
+    });
     const auto showMainWindow = [&] {
         setup.reset();
         window = std::make_unique<Window>(queue, library, engine);
-        window->showMaximized();
+        window->show();
+        if (!parseIds(links).isEmpty())
+            window->queueLinks(links);
+        links.clear();
         app.setQuitOnLastWindowClosed(true);
     };
     if (engine.needsSteamcmdSetup()) {
         app.setQuitOnLastWindowClosed(false);
         setup = std::make_unique<SteamSetupDialog>(engine);
-        QObject::connect(setup.get(), &QDialog::accepted, &app,
+        QObject::connect(setup.get(), &QDialog::finished, &app,
                          [&] { QTimer::singleShot(0, &app, showMainWindow); });
-        QObject::connect(setup.get(), &QDialog::rejected, &app, &QCoreApplication::quit);
         setup->open();
         QTimer::singleShot(0, &engine, &Engine::prepareSteamcmd);
     } else {

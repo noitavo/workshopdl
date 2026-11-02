@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ModsPage</class>
+ <widget class="QWidget" name="ModsPage">
+  <layout class="QVBoxLayout" name="pageLayout">
+   <property name="leftMargin"><number>8</number></property>
+   <property name="topMargin"><number>8</number></property>
+   <property name="rightMargin"><number>8</number></property>
+   <property name="bottomMargin"><number>8</number></property>
+   <item>
+    <widget class="QSplitter" name="mainSplitter">
+     <property name="orientation"><enum>Qt::Horizontal</enum></property>
+     <property name="childrenCollapsible"><bool>false</bool></property>
+     <widget class="QWidget" name="sidebar">
+      <layout class="QVBoxLayout" name="sidebarLayout">
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <item>
+        <widget class="QLineEdit" name="gameSearch">
+         <property name="placeholderText"><string>Search games</string></property>
+         <property name="accessibleName"><string>Search games</string></property>
+         <property name="clearButtonEnabled"><bool>true</bool></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QListWidget" name="gameList">
+         <property name="minimumSize"><size><width>250</width><height>0</height></size></property>
+         <property name="accessibleName"><string>Games</string></property>
+         <property name="iconSize"><size><width>92</width><height>43</height></size></property>
+         <property name="uniformItemSizes"><bool>false</bool></property>
+         <property name="spacing"><number>1</number></property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="gamePage">
+      <layout class="QVBoxLayout" name="gameLayout" stretch="0,0,1,0,0">
+       <property name="leftMargin"><number>0</number></property>
+       <property name="topMargin"><number>0</number></property>
+       <property name="rightMargin"><number>0</number></property>
+       <property name="bottomMargin"><number>0</number></property>
+       <item>
+        <layout class="QHBoxLayout" name="headerLayout" stretch="0,1,0">
+         <property name="spacing"><number>12</number></property>
+         <item>
+          <widget class="QLabel" name="gameArt">
+           <property name="minimumSize"><size><width>184</width><height>86</height></size></property>
+           <property name="maximumSize"><size><width>184</width><height>86</height></size></property><property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+           <property name="alignment"><set>Qt::AlignCenter</set></property>
+          </widget>
+         </item>
+         <item>
+          <layout class="QVBoxLayout" name="headerText">
+           <property name="spacing"><number>2</number></property>
+           <item>
+            <widget class="QLabel" name="gameTitle">
+             <property name="font"><font><pointsize>14</pointsize><bold>true</bold></font></property>
+             <property name="textFormat"><enum>Qt::PlainText</enum></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="gameSupport">
+             <property name="textFormat"><enum>Qt::PlainText</enum></property>
+             <property name="wordWrap"><bool>true</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="gameFolders">
+             <property name="textFormat"><enum>Qt::PlainText</enum></property>
+             <property name="wordWrap"><bool>true</bool></property>
+             <property name="textInteractionFlags"><set>Qt::TextSelectableByMouse</set></property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="headerTextSpace">
+             <property name="orientation"><enum>Qt::Vertical</enum></property>
+             <property name="sizeHint"><size><width>0</width><height>0</height></size></property>
+            </spacer>
+           </item>
+          </layout>
+         </item>
+         <item>
+          <layout class="QGridLayout" name="headerActions">
+           <item row="0" column="0"><widget class="QPushButton" name="playButton"><property name="text"><string>Play</string></property></widget></item>
+           <item row="0" column="1"><widget class="QPushButton" name="workshopButton"><property name="text"><string>Workshop</string></property></widget></item>
+           <item row="0" column="2"><widget class="QPushButton" name="pinButton"><property name="text"><string>Pin</string></property><property name="checkable"><bool>true</bool></property></widget></item>
+           <item row="1" column="0"><widget class="QToolButton" name="foldersButton"><property name="text"><string>Folders</string></property><property name="popupMode"><enum>QToolButton::InstantPopup</enum></property><property name="toolButtonStyle"><enum>Qt::ToolButtonTextOnly</enum></property><property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Fixed"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+           <item row="1" column="1"><widget class="QToolButton" name="profilesButton"><property name="text"><string>Profiles</string></property><property name="popupMode"><enum>QToolButton::InstantPopup</enum></property><property name="toolButtonStyle"><enum>Qt::ToolButtonTextOnly</enum></property><property name="sizePolicy"><sizepolicy hsizetype="Preferred" vsizetype="Fixed"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+           <item row="1" column="2"><widget class="QPushButton" name="loadOrderButton"><property name="text"><string>Load order…</string></property></widget></item>
+          </layout>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="filterLayout" stretch="1,0,0,0">
+         <item>
+          <widget class="QLineEdit" name="modSearch">
+           <property name="placeholderText"><string>Search mods</string></property>
+           <property name="accessibleName"><string>Search mods</string></property>
+           <property name="clearButtonEnabled"><bool>true</bool></property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="statusFilter">
+           <property name="accessibleName"><string>Filter by status</string></property>
+           <item><property name="text"><string>All mods</string></property></item>
+           <item><property name="text"><string>Not installed</string></property></item>
+           <item><property name="text"><string>Enabled</string></property></item>
+           <item><property name="text"><string>Disabled</string></property></item>
+           <item><property name="text"><string>Updates</string></property></item>
+           <item><property name="text"><string>Problems</string></property></item>
+           <item><property name="text"><string>Unmanaged</string></property></item>
+          </widget>
+         </item>
+         <item><widget class="QPushButton" name="checkUpdatesButton"><property name="text"><string>Check for updates</string></property></widget></item>
+         <item><widget class="QPushButton" name="updateAllButton"><property name="text"><string>Update all</string></property></widget></item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QSplitter" name="contentSplitter">
+         <property name="orientation"><enum>Qt::Horizontal</enum></property>
+         <property name="childrenCollapsible"><bool>false</bool></property>
+         <widget class="QWidget" name="listArea">
+          <layout class="QVBoxLayout" name="listLayout">
+           <property name="leftMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QTableView" name="modView">
+             <property name="accessibleName"><string>Mods</string></property>
+             <property name="contextMenuPolicy"><enum>Qt::CustomContextMenu</enum></property>
+             <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
+             <property name="alternatingRowColors"><bool>true</bool></property>
+             <property name="selectionMode"><enum>QAbstractItemView::ExtendedSelection</enum></property>
+             <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
+             <property name="showGrid"><bool>false</bool></property>
+             <property name="wordWrap"><bool>false</bool></property>
+             <property name="sortingEnabled"><bool>true</bool></property>
+             <attribute name="verticalHeaderVisible"><bool>false</bool></attribute>
+             <attribute name="verticalHeaderDefaultSectionSize"><number>28</number></attribute>
+            </widget>
+           </item>
+           <item>
+            <widget class="QFrame" name="emptyPanel">
+             <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+             <layout class="QVBoxLayout" name="emptyLayout" stretch="1,0,0,1">
+              <item>
+               <spacer name="emptyTop">
+                <property name="orientation"><enum>Qt::Vertical</enum></property>
+                <property name="sizeHint"><size><width>0</width><height>0</height></size></property>
+               </spacer>
+              </item>
+              <item>
+               <widget class="QLabel" name="emptyState">
+                <property name="alignment"><set>Qt::AlignCenter</set></property>
+                <property name="wordWrap"><bool>true</bool></property>
+                <property name="textFormat"><enum>Qt::PlainText</enum></property>
+               </widget>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="emptyActions">
+                <item>
+                 <spacer name="emptyLeft">
+                  <property name="orientation"><enum>Qt::Horizontal</enum></property>
+                  <property name="sizeHint"><size><width>0</width><height>0</height></size></property>
+                 </spacer>
+                </item>
+                <item><widget class="QPushButton" name="emptyAction"/></item>
+                <item>
+                 <spacer name="emptyRight">
+                  <property name="orientation"><enum>Qt::Horizontal</enum></property>
+                  <property name="sizeHint"><size><width>0</width><height>0</height></size></property>
+                 </spacer>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <spacer name="emptyBottom">
+                <property name="orientation"><enum>Qt::Vertical</enum></property>
+                <property name="sizeHint"><size><width>0</width><height>0</height></size></property>
+               </spacer>
+              </item>
+             </layout>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+         <widget class="QWidget" name="detailPanel">
+          <property name="minimumSize"><size><width>280</width><height>0</height></size></property>
+          <layout class="QVBoxLayout" name="detailLayout" stretch="0,0,0,1,0">
+           <property name="leftMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QLabel" name="detailPreview">
+             <property name="minimumSize"><size><width>268</width><height>160</height></size></property><property name="maximumSize"><size><width>16777215</width><height>160</height></size></property><property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
+             <property name="alignment"><set>Qt::AlignCenter</set></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="detailTitle">
+             <property name="font"><font><bold>true</bold></font></property>
+             <property name="textFormat"><enum>Qt::PlainText</enum></property>
+             <property name="wordWrap"><bool>true</bool></property>
+             <property name="textInteractionFlags"><set>Qt::TextSelectableByMouse</set></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="detailMeta">
+             <property name="textFormat"><enum>Qt::PlainText</enum></property>
+             <property name="wordWrap"><bool>true</bool></property>
+             <property name="textInteractionFlags"><set>Qt::TextSelectableByMouse</set></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPlainTextEdit" name="detailText">
+             <property name="accessibleName"><string>Mod description</string></property>
+             <property name="readOnly"><bool>true</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="requiredButton"><property name="text"><string>Required items…</string></property></widget>
+           </item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="actionLayout">
+         <item><widget class="QPushButton" name="installButton"><property name="text"><string>Install</string></property></widget></item>
+         <item><widget class="QPushButton" name="toggleButton"><property name="text"><string>Disable</string></property></widget></item>
+         <item><widget class="QPushButton" name="uninstallButton"><property name="text"><string>Uninstall</string></property></widget></item>
+         <item><widget class="QPushButton" name="openButton"><property name="text"><string>Open folder</string></property></widget></item>
+         <item><widget class="QPushButton" name="pageButton"><property name="text"><string>Workshop page</string></property></widget></item>
+         <item>
+          <spacer name="actionSpace">
+           <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           <property name="sizeHint"><size><width>20</width><height>20</height></size></property>
+          </spacer>
+         </item>
+         <item><widget class="QToolButton" name="moreButton"><property name="text"><string>More</string></property><property name="popupMode"><enum>QToolButton::InstantPopup</enum></property><property name="toolButtonStyle"><enum>Qt::ToolButtonTextOnly</enum></property></widget></item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="gameNote">
+         <property name="textFormat"><enum>Qt::PlainText</enum></property>
+         <property name="wordWrap"><bool>true</bool></property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <tabstops>
+  <tabstop>gameSearch</tabstop>
+  <tabstop>gameList</tabstop>
+  <tabstop>playButton</tabstop>
+  <tabstop>workshopButton</tabstop>
+  <tabstop>pinButton</tabstop>
+  <tabstop>foldersButton</tabstop>
+  <tabstop>profilesButton</tabstop>
+  <tabstop>loadOrderButton</tabstop>
+  <tabstop>modSearch</tabstop>
+  <tabstop>statusFilter</tabstop>
+  <tabstop>checkUpdatesButton</tabstop>
+  <tabstop>updateAllButton</tabstop>
+  <tabstop>modView</tabstop>
+  <tabstop>detailText</tabstop>
+  <tabstop>requiredButton</tabstop>
+  <tabstop>installButton</tabstop>
+  <tabstop>toggleButton</tabstop>
+  <tabstop>uninstallButton</tabstop>
+  <tabstop>openButton</tabstop>
+  <tabstop>pageButton</tabstop>
+  <tabstop>moreButton</tabstop>
+ </tabstops>
+ <resources />
+ <connections />
+</ui>

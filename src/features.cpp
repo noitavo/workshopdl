@@ -1,63 +1,9 @@
 #include "window.h"
+#include "modspage.h"
 #include "gma.h"
 #include "ui_supportdialog.h"
 #include "ui_archivedialog.h"
 #include "ui_archivecontentsdialog.h"
-#include "ui_activationdialog.h"
-#include "ui_installdialog.h"
-
-void Window::installedAction(const QString &action) {
-    if (diskBusy || engine.busy)
-        return;
-    QStringList keys;
-    for (const auto &index : installedView->selectionModel()->selectedRows()) {
-        const auto key = installedView->item(index.row(), 0)->data(Qt::UserRole).toString();
-        if (action == QStringLiteral("open") || !key.isEmpty())
-            keys << key;
-    }
-    if (keys.isEmpty()) {
-        activity->setText(QStringLiteral("Select installed mods first."));
-        return;
-    }
-    if (action == QStringLiteral("open")) {
-        const int row = installedView->selectionModel()->selectedRows().first().row();
-        QDesktopServices::openUrl(
-            QUrl::fromLocalFile(QDir::fromNativeSeparators(installedView->item(row, 3)->text())));
-        return;
-    }
-    if (QMessageBox::question(
-            this,
-            action == QStringLiteral("delete") ? QStringLiteral("Uninstall mods")
-                                               : QStringLiteral("Change installed mods"),
-            action == QStringLiteral("delete")
-                ? QStringLiteral("Remove the installed files for %1 mod(s)? Downloaded copies are kept.")
-                      .arg(keys.size())
-                : QStringLiteral("Enable or disable files for %1 mods? Close the game first. In-game "
-                                 "settings will not change.")
-                      .arg(keys.size())) != QMessageBox::Yes)
-        return;
-    diskBusy = true;
-    refresh();
-    auto *watcher = new QFutureWatcher<QStringList>(this);
-    connect(watcher, &QFutureWatcher<QStringList>::finished, this, [this, watcher] {
-        const auto errors = watcher->result();
-        watcher->deleteLater();
-        diskBusy = false;
-        refresh();
-        reloadInstalled();
-        if (!errors.isEmpty())
-            QMessageBox::warning(this, QStringLiteral("Some mods were kept"), errors.join(QLatin1Char('\n')));
-    });
-    watcher->setFuture(QtConcurrent::run([keys, action] {
-        QStringList errors;
-        for (const auto &key : keys) {
-            const QString error = manageInstalled(key, action);
-            if (!error.isEmpty())
-                errors << key + QStringLiteral(": ") + error;
-        }
-        return errors;
-    }));
-}
 
 void Window::pasteMultiple() {
     QInputDialog dialog(this);
@@ -118,7 +64,9 @@ void Window::importLocalMod(bool folder) {
         watcher->deleteLater();
         diskBusy = false;
         if (error.isEmpty()) {
-            library.add(item);
+            Item added = item;
+            added.size = directoryBytes(item.path);
+            library.add(added);
             writeJson(item.path + QStringLiteral(".workshopdl.json"),
                       QJsonDocument(QJsonObject{{QStringLiteral("id"), item.id},
                                                 {QStringLiteral("app"), item.appId},
@@ -126,6 +74,7 @@ void Window::importLocalMod(bool folder) {
                                                 {QStringLiteral("local"), true}}));
             engine.persist();
             tabs->setCurrentIndex(2);
+            modsPage->showGame(item.appId);
         } else
             QMessageBox::warning(this, QStringLiteral("Import failed"), error);
         refresh();
@@ -135,6 +84,7 @@ void Window::importLocalMod(bool folder) {
         const QString stage = item.path + QStringLiteral(".partial");
         if (linkedAncestor(item.path) || QFileInfo::exists(item.path) || !QDir().mkpath(stage))
             return QStringLiteral("Cannot create the import folder.");
+        auto cleanup = qScopeGuard([stage] { QDir(stage).removeRecursively(); });
         if (folder) {
             if (!copyTree(source, stage, &error))
                 return error;
@@ -168,9 +118,7 @@ void Window::showSupport() {
             name->setData(Qt::UserRole, p.id);
             table->setItem(row, 0, name);
             table->setItem(row, 1,
-                           new QTableWidgetItem(p.format == QStringLiteral("manual")
-                                                    ? QStringLiteral("Manual")
-                                                    : QStringLiteral("Package-specific")));
+                           new QTableWidgetItem(supportLevel(p)));
             const auto folder =
                 engine.settings.value(QStringLiteral("gameFolders/") + p.id, found.value(p.id)).toString();
             table->setItem(row, 2, new QTableWidgetItem(QDir::toNativeSeparators(folder)));
@@ -183,10 +131,8 @@ void Window::showSupport() {
                                                     : QStringLiteral("Steam access required")));
             table->setItem(
                 row, 5,
-                new QTableWidgetItem(p.id == QStringLiteral("294100") ? QStringLiteral("Built-in editor")
-                                     : p.id == QStringLiteral("427520") || p.id == QStringLiteral("1281930")
-                                         ? QStringLiteral("Existing entries")
-                                         : QStringLiteral("In game / launcher")));
+                new QTableWidgetItem(p.activation.isEmpty() ? QStringLiteral("In game / launcher")
+                                                            : QStringLiteral("In Mods tab")));
         }
     };
     auto *watcher = new QFutureWatcher<QHash<QString, QString>>(&dialog);
@@ -222,8 +168,13 @@ void Window::showSupport() {
         navigate(QUrl(QStringLiteral("https://steamcommunity.com/app/%1/workshop/").arg(id)));
         dialog.accept();
     });
+    connect(table, &QTableWidget::currentCellChanged, &dialog, [table, note = form.note](int row) {
+        if (row >= 0 && table->item(row, 3))
+            note->setText(table->item(row, 3)->text());
+    });
     connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
     dialog.exec();
+    modsPage->reload();
 }
 
 void Window::gameTools() {
@@ -377,230 +328,4 @@ void Window::gameTools() {
         }));
     });
     dialog.exec();
-}
-
-void Window::activationDialog() {
-    if (engine.busy || diskBusy)
-        return;
-    QString path =
-        QFileInfo(qEnvironmentVariable("LOCALAPPDATA")).absolutePath() +
-        QStringLiteral("/LocalLow/Ludeon Studios/RimWorld by Ludeon Studios/Config/ModsConfig.xml");
-    if (!QFileInfo::exists(path))
-        path = QFileDialog::getOpenFileName(this, QStringLiteral("Select RimWorld ModsConfig.xml"), {},
-                                            QStringLiteral("RimWorld config (ModsConfig.xml)"));
-    if (path.isEmpty() || linkedAncestor(path))
-        return;
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly) || file.size() > 4 * 1024 * 1024) {
-        QMessageBox::warning(this, QStringLiteral("Cannot read configuration"),
-                             QStringLiteral("Choose a readable ModsConfig.xml smaller than 4 MB."));
-        return;
-    }
-    const QByteArray original = file.readAll();
-    QDomDocument doc;
-    if (!doc.setContent(original)) {
-        QMessageBox::warning(this, QStringLiteral("Load order"),
-                             QStringLiteral("Invalid RimWorld configuration."));
-        return;
-    }
-    file.close();
-    auto root = doc.documentElement();
-    auto active = root.firstChildElement(QStringLiteral("activeMods"));
-    if (active.isNull()) {
-        QMessageBox::warning(this, QStringLiteral("Load order"),
-                             QStringLiteral("No activeMods list was found. Nothing was changed."));
-        return;
-    }
-    QDialog dialog(this);
-    Ui::ActivationDialog form;
-    form.setupUi(&dialog);
-    auto *list = form.list;
-    auto *buttons = form.buttons;
-    QSet<QString> names;
-    for (auto node = active.firstChildElement(QStringLiteral("li")); !node.isNull();
-         node = node.nextSiblingElement(QStringLiteral("li"))) {
-        const QString id = node.text();
-        auto *item = new QListWidgetItem(id, list);
-        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        item->setCheckState(Qt::Checked);
-        names.insert(id.toCaseFolded());
-    }
-    const auto records = installedRecords();
-    for (const auto &value : records) {
-        const auto record = value.toObject();
-        if (record.value(QStringLiteral("app")).toString() != QStringLiteral("294100") ||
-            record.value(QStringLiteral("disabled")).toBool())
-            continue;
-        for (const auto &relative : record.value(QStringLiteral("paths")).toArray()) {
-            QFile about(record.value(QStringLiteral("root")).toString() + QLatin1Char('/') +
-                        relative.toString() + QStringLiteral("/About/About.xml"));
-            if (!about.open(QIODevice::ReadOnly))
-                continue;
-            QDomDocument metadata;
-            if (!metadata.setContent(about.readAll()))
-                continue;
-            const auto id = metadata.documentElement().firstChildElement(QStringLiteral("packageId")).text();
-            if (id.isEmpty() || names.contains(id.toCaseFolded()))
-                continue;
-            names.insert(id.toCaseFolded());
-            auto *entry = new QListWidgetItem(id, list);
-            entry->setFlags(entry->flags() | Qt::ItemIsUserCheckable);
-            entry->setCheckState(Qt::Unchecked);
-        }
-    }
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
-        QFile current(path);
-        if (!current.open(QIODevice::ReadOnly) || current.readAll() != original) {
-            QMessageBox::warning(&dialog, QStringLiteral("Configuration changed"),
-                                 QStringLiteral("The file changed. Close and reopen this editor."));
-            return;
-        }
-        current.close();
-        while (!active.firstChild().isNull())
-            active.removeChild(active.firstChild());
-        for (int n = 0; n < list->count(); ++n)
-            if (list->item(n)->checkState() == Qt::Checked) {
-                auto li = doc.createElement(QStringLiteral("li"));
-                li.appendChild(doc.createTextNode(list->item(n)->text()));
-                active.appendChild(li);
-            }
-        const QString backup = path + QStringLiteral(".workshopdl-") +
-                               QString::number(QDateTime::currentMSecsSinceEpoch()) + QStringLiteral(".bak");
-        if (!QFile::copy(path, backup)) {
-            QMessageBox::warning(&dialog, QStringLiteral("Save failed"),
-                                 QStringLiteral("Cannot back up the original configuration."));
-            return;
-        }
-        QSaveFile out(path);
-        const auto bytes = doc.toByteArray(2);
-        if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit()) {
-            QMessageBox::warning(&dialog, QStringLiteral("Save failed"), out.errorString());
-            return;
-        }
-        dialog.accept();
-    });
-    dialog.exec();
-}
-
-void Window::installItems(const QStringList &ids, bool automatic) {
-    if (ids.isEmpty() || diskBusy || engine.busy)
-        return;
-    struct Request {
-        Item item;
-        QString target;
-    };
-    QList<Request> requests;
-    QDialog dialog(this);
-    Ui::InstallDialog form;
-    form.setupUi(&dialog);
-    auto *table = form.table;
-    auto *browse = form.browse;
-    auto *buttons = form.buttons;
-    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    table->setColumnWidth(1, 140);
-    const auto &found = discoveredGameFolders;
-    for (const auto &id : ids) {
-        const auto *item = library.get(id);
-        if (!item)
-            continue;
-        const auto p = profileFor(item->appId);
-        if (p.format == QStringLiteral("manual")) {
-            if (!automatic)
-                appendLog(p.name + QStringLiteral(": ") + p.note);
-            continue;
-        }
-        QString target = engine.settings.value(QStringLiteral("destinations/") + item->appId).toString();
-        if (target.isEmpty())
-            target = gameDestination(
-                item->appId,
-                engine.settings.value(QStringLiteral("gameFolders/") + item->appId, found.value(item->appId))
-                    .toString());
-        if (automatic &&
-            engine.settings.value(QStringLiteral("destinations/") + item->appId).toString().isEmpty())
-            continue;
-        const int row = table->rowCount();
-        table->insertRow(row);
-        auto *title = new QTableWidgetItem(item->title);
-        title->setData(Qt::UserRole, item->id);
-        title->setCheckState(Qt::Checked);
-        title->setFlags((title->flags() | Qt::ItemIsUserCheckable) & ~Qt::ItemIsEditable);
-        table->setItem(row, 0, title);
-        auto *name = new QTableWidgetItem(p.name);
-        name->setFlags(name->flags() & ~Qt::ItemIsEditable);
-        table->setItem(row, 1, name);
-        table->setItem(row, 2, new QTableWidgetItem(target));
-    }
-    if (!table->rowCount()) {
-        if (!automatic)
-            QMessageBox::information(
-                this, QStringLiteral("Installation"),
-                QStringLiteral("No installable items selected. See Game support for package requirements."));
-        return;
-    }
-    connect(browse, &QPushButton::clicked, &dialog, [&] {
-        const int row = table->currentRow();
-        if (row < 0)
-            return;
-        const auto path = QFileDialog::getExistingDirectory(
-            &dialog, QStringLiteral("Choose the game's mod destination"), table->item(row, 2)->text());
-        if (!path.isEmpty())
-            table->item(row, 2)->setText(path);
-    });
-    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Install selected"));
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
-        for (int row = 0; row < table->rowCount(); ++row)
-            if (table->item(row, 0)->checkState() == Qt::Checked &&
-                !QDir::isAbsolutePath(table->item(row, 2)->text())) {
-                QMessageBox::warning(
-                    &dialog, QStringLiteral("Destination required"),
-                    QStringLiteral("Choose an absolute mod destination for each selected item."));
-                return;
-            }
-        dialog.accept();
-    });
-    if (!automatic && dialog.exec() != QDialog::Accepted)
-        return;
-    for (int row = 0; row < table->rowCount(); ++row)
-        if (table->item(row, 0)->checkState() == Qt::Checked) {
-            const auto *item = library.get(table->item(row, 0)->data(Qt::UserRole).toString());
-            if (!item)
-                continue;
-            const QString target = table->item(row, 2)->text();
-            if (target.isEmpty() || !QDir::isAbsolutePath(target))
-                continue;
-            engine.settings.setValue(QStringLiteral("destinations/") + item->appId, target);
-            requests.append({*item, target});
-        }
-    if (requests.isEmpty())
-        return;
-    diskBusy = true;
-    refresh();
-    activity->setText(QStringLiteral("Installing %1 mod(s)…").arg(requests.size()));
-    auto *watcher = new QFutureWatcher<QStringList>(this);
-    connect(watcher, &QFutureWatcher<QStringList>::finished, this, [this, watcher, automatic] {
-        const auto errors = watcher->result();
-        watcher->deleteLater();
-        diskBusy = false;
-        refresh();
-        reloadInstalled();
-        if (!errors.isEmpty()) {
-            const auto text = errors.join(QStringLiteral("\n\n"));
-            appendLog(text);
-            if (!automatic)
-                QMessageBox::warning(this, QStringLiteral("Some mods were not installed"), text);
-        } else
-            activity->setText(QStringLiteral("Installed. Enable mods in the game."));
-    });
-    watcher->setFuture(QtConcurrent::run([requests] {
-        QStringList errors;
-        for (const auto &request : requests) {
-            const auto error = installContent(request.item, request.target);
-            if (!error.isEmpty())
-                errors << request.item.title + QStringLiteral(": ") + error;
-        }
-        return errors;
-    }));
 }

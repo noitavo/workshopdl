@@ -3,7 +3,7 @@
  <class>SupportDialog</class>
  <widget class="QDialog" name="SupportDialog">
   <property name="windowTitle">
-   <string>Games and installation rules</string>
+   <string>Mod Manager support</string>
   </property>
   <property name="geometry">
    <rect>

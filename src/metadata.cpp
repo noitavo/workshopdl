@@ -47,11 +47,13 @@ void Engine::inspectWorkshop(const QStringList &ids, QObject *context,
         for (const auto &id : ids) {
             WorkshopEntry entry;
             entry.details = details.value(id);
-            if (!error.isEmpty() && entry.details.isEmpty())
+            if (!error.isEmpty() && entry.details.isEmpty()) {
                 entry.error = error;
-            else if (entry.details.value(QStringLiteral("result")).toVariant().toInt() != 1)
+                entry.transient = true;
+            } else if (entry.details.value(QStringLiteral("result")).toVariant().toInt() != 1)
                 entry.error =
-                    QStringLiteral("Item unavailable. It may be private, removed, or inaccessible.");
+                    QStringLiteral("Item unavailable. It may be private or removed. If your account can "
+                                   "access it, set its App ID from the item menu.");
             else
                 candidates.append(id);
             entries->insert(id, entry);
@@ -86,6 +88,7 @@ void Engine::inspectWorkshop(const QStringList &ids, QObject *context,
                             entry.details.value(QStringLiteral("filetype")).toVariant().toInt() == 2;
                         if (!error.isEmpty()) {
                             entry.error = QStringLiteral("Could not check collection details: ") + error;
+                            entry.transient = true;
                         } else if (result == 1) {
                             entry.collection = true;
                             for (const auto &child : collection.value(QStringLiteral("children")).toArray()) {

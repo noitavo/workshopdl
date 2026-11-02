@@ -22,6 +22,7 @@ void Engine::checkLibrary() {
                 item.title = object.value(QStringLiteral("title")).toString(item.title);
                 item.fileUrl = object.value(QStringLiteral("file_url")).toString();
                 item.filename = object.value(QStringLiteral("filename")).toString();
+                applyWorkshopDetails(item, object);
             }
             if (item.path.isEmpty() || !QDir(item.path).exists())
                 item.status = QStringLiteral("Missing files");
@@ -33,7 +34,7 @@ void Engine::checkLibrary() {
             } else if (object.value(QStringLiteral("time_updated")).toInteger() > item.updated) {
                 item.status = QStringLiteral("Update available");
                 ++updates;
-            } else {
+            } else if (item.status != QStringLiteral("Incomplete")) {
                 item.status = QStringLiteral("Completed");
                 item.error.clear();
             }
@@ -161,6 +162,9 @@ void Engine::directDownload() {
     connect(reply, &QNetworkReply::finished, this, [this, reply, file, expected, writeError] {
         reply->deleteLater();
         directReply.clear();
+        const auto remainder = reply->readAll();
+        if (writeError->isEmpty() && file->write(remainder) != remainder.size())
+            *writeError = file->errorString();
         if (retryRequested) {
             retryRequested = false;
             file->cancelWriting();

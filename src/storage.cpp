@@ -42,6 +42,38 @@ void forgetPassword() {
     CredDeleteW(L"WorkshopDL++/Steam", CRED_TYPE_GENERIC, 0);
 #endif
 }
+QString savedApiKey() {
+#ifdef Q_OS_WIN
+    PCREDENTIALW credential = nullptr;
+    if (CredReadW(L"WorkshopDL++/SteamWebApi", CRED_TYPE_GENERIC, 0, &credential)) {
+        const QString value = QString::fromUtf8(reinterpret_cast<const char *>(credential->CredentialBlob),
+                                                int(credential->CredentialBlobSize));
+        CredFree(credential);
+        return value;
+    }
+#endif
+    return {};
+}
+bool storeApiKey(const QString &key) {
+#ifdef Q_OS_WIN
+    if (key.isEmpty()) {
+        CredDeleteW(L"WorkshopDL++/SteamWebApi", CRED_TYPE_GENERIC, 0);
+        return true;
+    }
+    const QByteArray bytes = key.toUtf8();
+    if (bytes.size() > CRED_MAX_CREDENTIAL_BLOB_SIZE)
+        return false;
+    CREDENTIALW credential{};
+    credential.Type = CRED_TYPE_GENERIC;
+    credential.TargetName = const_cast<wchar_t *>(L"WorkshopDL++/SteamWebApi");
+    credential.CredentialBlobSize = DWORD(bytes.size());
+    credential.CredentialBlob = reinterpret_cast<LPBYTE>(const_cast<char *>(bytes.constData()));
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    return CredWriteW(&credential, 0) != FALSE;
+#else
+    return false;
+#endif
+}
 
 QString dataRoot() {
     const QString path = QCoreApplication::applicationDirPath() + QStringLiteral("/data");
@@ -111,20 +143,10 @@ QString gameName(const QString &id) {
     for (const auto &p : gameProfiles())
         if (p.id == id)
             return p.name;
-    static const QHash<QString, QString> names{
-        {QStringLiteral("4000"), QStringLiteral("Garry's Mod")},
-        {QStringLiteral("294100"), QStringLiteral("RimWorld")},
-        {QStringLiteral("550"), QStringLiteral("Left 4 Dead 2")},
-        {QStringLiteral("108600"), QStringLiteral("Project Zomboid")},
-        {QStringLiteral("107410"), QStringLiteral("Arma 3")},
-        {QStringLiteral("211820"), QStringLiteral("Starbound")},
-        {QStringLiteral("322330"), QStringLiteral("Don't Starve Together")},
-        {QStringLiteral("431960"), QStringLiteral("Wallpaper Engine")},
-        {QStringLiteral("255710"), QStringLiteral("Cities: Skylines")},
-        {QStringLiteral("346110"), QStringLiteral("ARK: Survival Evolved")},
-        {QStringLiteral("620"), QStringLiteral("Portal 2")},
-        {QStringLiteral("244850"), QStringLiteral("Space Engineers")}};
-    return names.value(id, id.isEmpty() ? QString() : QStringLiteral("App ") + id);
+    const QString known = knownGameName(id);
+    if (!known.isEmpty())
+        return known;
+    return id.isEmpty() ? QString() : QStringLiteral("App ") + id;
 }
 bool writeJson(const QString &path, const QJsonDocument &doc, QString *error) {
     QSaveFile file(path);
@@ -207,6 +229,34 @@ bool copyTree(const QString &source, const QString &target, QString *error) {
         }
     }
     return true;
+}
+
+bool renamePath(const QString &from, const QString &to) {
+    for (int attempt = 0;; ++attempt) {
+        if (QDir().rename(from, to))
+            return true;
+        if (attempt == 9 || !QFileInfo::exists(from) || QFileInfo::exists(to))
+            return false;
+        QThread::msleep(300);
+    }
+}
+
+qint64 directoryBytes(const QString &path) {
+    qint64 bytes = 0;
+    QDirIterator it(path, QDir::Files | QDir::Hidden | QDir::System, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        bytes += it.fileInfo().size();
+    }
+    return bytes;
+}
+
+void removeSteamCopy(const QString &contentPath) {
+    QDir(contentPath).removeRecursively();
+    QDir app(QFileInfo(contentPath).absolutePath());
+    const QString appId = app.dirName();
+    if (app.cdUp() && app.cdUp())
+        QFile::remove(app.filePath(QStringLiteral("appworkshop_%1.acf").arg(appId)));
 }
 
 bool pathsOverlap(const QString &first, const QString &second) {

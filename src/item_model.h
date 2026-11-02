@@ -3,11 +3,13 @@
 #include <QList>
 #include <QString>
 #include <QSet>
+#include <QHash>
 
 struct Item {
     QString id, appId, title, game, status = QStringLiteral("Resolving"), error, path;
     qint64 size = 0, updated = 0;
-    QString fileUrl, filename;
+    QString fileUrl, filename, previewUrl, description, creator;
+    QStringList tags;
     bool local = false, manualAppId = false;
     int progress = -1;
 };
@@ -33,4 +35,7 @@ class ItemModel : public QAbstractTableModel {
   private:
     int maximumItems;
     QSet<QString> unreadableFiles;
+    mutable QHash<QString, int> rows;
+    mutable bool rowsValid = false;
+    bool dirty = true;
 };

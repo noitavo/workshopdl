@@ -7,7 +7,18 @@ if not exist "%QT_BIN%\windeployqt.exe" exit /b 1
 if not exist "%APP_EXE%" exit /b 1
 if /I not "%BUILD_MODE%"=="debug" if /I not "%BUILD_MODE%"=="release" exit /b 1
 set "PATH=%QT_BIN%;%PATH%"
-"%QT_BIN%\windeployqt.exe" --%BUILD_MODE% --no-translations --compiler-runtime "%APP_EXE%" || exit /b 1
+"%QT_BIN%\windeployqt.exe" --%BUILD_MODE% --no-translations --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-system-dxc-compiler "%APP_EXE%" || exit /b 1
+if /I "%BUILD_MODE%"=="release" (
+    if not defined VCToolsRedistDir (
+        echo VCToolsRedistDir is not set. Build from a Visual Studio x64 environment.
+        exit /b 1
+    )
+    for /d %%D in ("%VCToolsRedistDir%x64\Microsoft.VC*.CRT") do copy /Y "%%~D\*.dll" "%~dp2" >nul || exit /b 1
+    if not exist "%~dp2vcruntime140.dll" (
+        echo The Visual C++ runtime was not found in "%VCToolsRedistDir%".
+        exit /b 1
+    )
+)
 set "LICENSE_DIR=%~dp2licenses"
 if not exist "%LICENSE_DIR%" mkdir "%LICENSE_DIR%"
 if exist "%QT_BIN%\..\..\..\Licenses\LICENSE" copy /Y "%QT_BIN%\..\..\..\Licenses\LICENSE" "%LICENSE_DIR%\Qt.txt" >nul || exit /b 1

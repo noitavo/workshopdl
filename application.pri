@@ -1,6 +1,7 @@
 QT += core gui widgets network concurrent xml svg
 CONFIG += c++20
 CONFIG -= debug_and_release
+CONFIG += force_debug_info
 !versionAtLeast(QT_VERSION, 6.10.0):error("WorkshopDL++ requires Qt 6.10 or later.")
 !win32:error("WorkshopDL++ requires Windows.")
 !msvc:error("WorkshopDL++ requires the MSVC Qt kit.")
@@ -23,11 +24,11 @@ FORMS += \
     $$PWD/forms/dependenciesdialog.ui \
     $$PWD/forms/gameactivationdialog.ui \
     $$PWD/forms/gettingstarteddialog.ui \
-    $$PWD/forms/historydialog.ui \
     $$PWD/forms/installdialog.ui \
     $$PWD/forms/logdialog.ui \
     $$PWD/forms/mainwindow.ui \
     $$PWD/forms/settingsdialog.ui \
+    $$PWD/forms/modspage.ui \
     $$PWD/forms/statuspanel.ui \
     $$PWD/forms/steamsetupdialog.ui \
     $$PWD/forms/supportdialog.ui
@@ -45,14 +46,19 @@ SOURCES += \
     $$PWD/src/features.cpp \
     $$PWD/src/gma.cpp \
     $$PWD/src/webview.cpp \
-    $$PWD/src/mods.cpp \
+    $$PWD/src/mod_store.cpp \
+    $$PWD/src/mod_model.cpp \
+    $$PWD/src/modspage.cpp \
+    $$PWD/src/imagecache.cpp \
+    $$PWD/src/catalog.cpp \
+    $$PWD/src/history_model.cpp \
     $$PWD/src/metadata.cpp \
     $$PWD/src/menus.cpp \
     $$PWD/src/window_layout.cpp \
     $$PWD/src/queue_actions.cpp \
-    $$PWD/src/library_filter.cpp \
     $$PWD/src/maintenance.cpp \
     $$PWD/src/icons.cpp \
+    $$PWD/src/taskbar.cpp \
     $$PWD/src/bookmarks.cpp
 HEADERS += \
     $$PWD/src/item_model.h \
@@ -63,10 +69,17 @@ HEADERS += \
     $$PWD/src/window.h \
     $$PWD/src/steamsetupdialog.h \
     $$PWD/src/webview.h \
-    $$PWD/src/library_filter.h \
-    $$PWD/src/icons.h
+    $$PWD/src/mod_store.h \
+    $$PWD/src/mod_model.h \
+    $$PWD/src/modspage.h \
+    $$PWD/src/imagecache.h \
+    $$PWD/src/history_model.h \
+    $$PWD/src/icons.h \
+    $$PWD/src/taskbar.h
 INCLUDEPATH += $$PWD/third_party/webview2
 win32 {
-    LIBS += -luser32 -ladvapi32 -lole32 -loleaut32 -lversion -lshlwapi $$PWD/third_party/webview2/WebView2LoaderStatic.lib
+    LIBS += -luser32 -ladvapi32 -lole32 -loleaut32 -lversion -lshlwapi -luuid -ldbghelp $$PWD/third_party/webview2/WebView2LoaderStatic.lib
     QMAKE_CXXFLAGS += /utf-8 /MP4
+    QMAKE_CXXFLAGS_RELEASE += /guard:cf
+    QMAKE_LFLAGS_RELEASE += /guard:cf
 }
